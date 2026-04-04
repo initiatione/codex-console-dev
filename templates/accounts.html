@@ -1,0 +1,591 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>账号管理 - OpenAI 注册系统</title>
+    <link rel="stylesheet" href="/static/css/style.css?v={{ static_version }}">
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📋</text></svg>">
+    <style>
+        :root {
+            --account-green: #22c55e;
+            --account-green-soft: #16a34a;
+            --mother-purple: #6366f1;
+        }
+        .stats-grid {
+            grid-template-columns: repeat(6, minmax(0, 1fr));
+        }
+        .stat-card.mother::before {
+            background: var(--mother-purple);
+        }
+        @media (max-width: 1280px) {
+            .stats-grid {
+                grid-template-columns: repeat(3, minmax(0, 1fr));
+            }
+        }
+        @media (max-width: 768px) {
+            .stats-grid {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
+        }
+        @media (max-width: 480px) {
+            .stats-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+        .password-cell {
+            font-family: var(--font-mono);
+            font-size: 0.75rem;
+        }
+        .password-hidden {
+            filter: blur(4px);
+            cursor: pointer;
+            transition: filter 0.2s;
+        }
+        .password-hidden:hover {
+            filter: blur(0);
+        }
+        .token-status {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+        .token-status .dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+        }
+        .token-status .dot.healthy { background: var(--success-color); }
+        .token-status .dot.warning { background: var(--warning-color); }
+        .token-status .dot.expired { background: var(--danger-color); }
+        .cpa-status {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 12px;
+        }
+        .cpa-status-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            display: inline-block;
+            border: 1px solid rgba(0, 0, 0, 0.12);
+            background: #3b82f6;
+        }
+        .account-status-cell {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 100%;
+        }
+        .account-status-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            display: inline-block;
+            border: 1px solid rgba(0, 0, 0, 0.12);
+        }
+        .account-status-dot.active {
+            background: var(--account-green);
+        }
+        .account-status-dot.expired {
+            background: var(--warning-color);
+        }
+        .account-status-dot.failed {
+            background: var(--danger-color);
+        }
+        .account-status-dot.banned {
+            background: var(--danger-color);
+        }
+        .account-status-dot.unknown {
+            background: var(--border-color);
+        }
+        .subscription-status {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+            min-width: 74px;
+        }
+        .subscription-status .dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            display: inline-block;
+            border: 1px solid rgba(0, 0, 0, 0.12);
+        }
+        .subscription-status .label {
+            font-size: 0.74rem;
+            font-weight: 600;
+            color: var(--text-secondary);
+            letter-spacing: 0.2px;
+        }
+        .subscription-status.plus .dot { background: var(--account-green); }
+        .subscription-status.plus .label { color: var(--account-green-soft); }
+        .subscription-status.team .dot { background: var(--primary-color); }
+        .subscription-status.team .label { color: var(--primary-color); }
+        .subscription-status.free .dot { background: var(--danger-color); }
+        .subscription-status.free .label { color: var(--danger-color); }
+        .account-label-badge {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-width: 38px;
+            padding: 1px 6px;
+            border-radius: 999px;
+            font-size: 0.68rem;
+            font-weight: 600;
+            line-height: 1.4;
+            border: 1px solid transparent;
+        }
+        .account-label-badge.mother {
+            color: #5b21b6;
+            background: rgba(99, 102, 241, 0.16);
+            border-color: rgba(99, 102, 241, 0.34);
+        }
+        .account-label-badge.child {
+            color: #1d4ed8;
+            background: rgba(59, 130, 246, 0.14);
+            border-color: rgba(59, 130, 246, 0.3);
+        }
+        .auto-quick-refresh-runtime {
+            margin-top: 12px;
+            padding: 12px;
+            border-radius: 8px;
+            border: 1px solid var(--border);
+            background: var(--surface-hover);
+            font-size: 0.82rem;
+            line-height: 1.5;
+            color: var(--text-secondary);
+        }
+        .auto-quick-refresh-form {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+        }
+        .auto-quick-refresh-form .form-group > label {
+            display: block;
+            margin-bottom: 6px;
+            font-size: 0.86rem;
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+        .auto-quick-refresh-form .field-full {
+            grid-column: span 2;
+        }
+        .auto-quick-refresh-check {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin: 0;
+            font-size: 0.86rem;
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+        .auto-quick-refresh-form input[type="checkbox"] {
+            width: 16px;
+            height: 16px;
+            margin: 0;
+            accent-color: var(--primary-color);
+            flex: 0 0 16px;
+        }
+        .auto-quick-refresh-form .form-select {
+            min-height: 38px;
+            font-size: 0.86rem;
+        }
+        .auto-quick-refresh-log-title {
+            margin-bottom: 8px;
+            font-size: 0.86rem;
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+        .auto-quick-refresh-log-list {
+            max-height: 180px;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+        .auto-quick-refresh-log-empty {
+            font-size: 0.82rem;
+            color: var(--text-muted);
+        }
+        .auto-quick-refresh-log-item {
+            display: grid;
+            grid-template-columns: 132px 56px 1fr;
+            gap: 8px;
+            align-items: start;
+            font-size: 0.8rem;
+            line-height: 1.4;
+        }
+        .auto-quick-refresh-log-item .log-time {
+            color: var(--text-muted);
+            white-space: nowrap;
+        }
+        .auto-quick-refresh-log-item .log-level {
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.2px;
+        }
+        .auto-quick-refresh-log-item .log-message {
+            color: var(--text-secondary);
+            word-break: break-word;
+        }
+        .auto-quick-refresh-log-item.level-success .log-level {
+            color: var(--account-green);
+        }
+        .auto-quick-refresh-log-item.level-warning .log-level {
+            color: var(--warning-color, #f59e0b);
+        }
+        .auto-quick-refresh-log-item.level-error .log-level {
+            color: var(--danger-color);
+        }
+        .auto-quick-refresh-log-item.level-info .log-level {
+            color: var(--primary-color);
+        }
+    </style>
+</head>
+<body>
+    {% include "partials/site_notice.html" %}
+    <div class="container">
+        <!-- 导航栏 -->
+        <nav class="navbar">
+            <div class="nav-brand">
+                <h1>OpenAI 注册系统</h1>
+            </div>
+            <div class="nav-links">
+                <a href="/" class="nav-link">注册</a>
+                <a href="/accounts" class="nav-link active">账号管理</a>
+                <a href="/email-services" class="nav-link">邮箱服务</a>
+                <a href="/payment" class="nav-link">支付</a>
+                <a href="/card-pool" class="nav-link">卡池</a>
+                <a href="/auto-team" class="nav-link">team</a>
+                <a href="/logs" class="nav-link">后台日志</a>
+                <a href="/settings" class="nav-link">设置</a>
+                <a href="/logout" class="nav-link">退出</a>
+            </div>
+                        <div class="nav-actions">
+            <a href="/selfcheck" class="selfcheck-toggle" title="系统自检">⚙️</a>
+            <button class="theme-toggle" onclick="theme.toggle()" title="切换主题">🌙</button>
+        </div>
+        </nav>
+
+        <!-- 主内容区 -->
+        <main class="main-content">
+            <div class="page-header">
+                <h2>账号管理</h2>
+                <p class="subtitle">查看和管理已注册的 OpenAI 账号</p>
+            </div>
+
+            <!-- 统计卡片 -->
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-value" id="total-accounts">0</div>
+                    <div class="stat-label">总账号数</div>
+                </div>
+                <div class="stat-card success">
+                    <div class="stat-value" id="active-accounts">0</div>
+                    <div class="stat-label">活跃账号</div>
+                </div>
+                <div class="stat-card warning">
+                    <div class="stat-value" id="expired-accounts">0</div>
+                    <div class="stat-label">过期账号</div>
+                </div>
+                <div class="stat-card danger">
+                    <div class="stat-value" id="failed-accounts">0</div>
+                    <div class="stat-label">失败账号</div>
+                </div>
+                <div class="stat-card mother">
+                    <div class="stat-value" id="mother-accounts">0</div>
+                    <div class="stat-label">母号账号</div>
+                </div>
+                <div class="stat-card info">
+                    <div class="stat-value" id="child-accounts">0</div>
+                    <div class="stat-label">子号账号</div>
+                </div>
+            </div>
+
+            <!-- 工具栏 -->
+            <div class="card toolbar-card">
+                <div class="card-body toolbar">
+                    <div class="toolbar-left">
+                        <select id="filter-status" class="form-select">
+                            <option value="">全部状态</option>
+                            <option value="active">活跃</option>
+                            <option value="expired">过期</option>
+                            <option value="banned">封禁</option>
+                            <option value="failed">失败</option>
+                        </select>
+
+                        <select id="filter-service" class="form-select">
+                            <option value="">全部邮箱服务</option>
+                            <option value="tempmail">Tempmail</option>
+                            <option value="outlook">Outlook</option>
+                            <option value="moe_mail">MoeMail</option>
+                        </select>
+
+                        <select id="filter-role-tag" class="form-select">
+                            <option value="">全部标号</option>
+                            <option value="parent">母号</option>
+                            <option value="child">子号</option>
+                            <option value="none">普通</option>
+                        </select>
+
+                        <input type="text" id="search-input" class="form-input" placeholder="🔍 搜索邮箱..." style="min-width: 200px;">
+                    </div>
+
+                    <div class="toolbar-right">
+                        <button class="btn btn-warning" id="batch-refresh-btn" disabled title="批量刷新Token">
+                            🔄 刷新Token
+                        </button>
+                        <button class="btn btn-info" id="batch-validate-btn" disabled title="批量验证Token">
+                            ✅ 验证Token
+                        </button>
+                        <button class="btn btn-info" id="batch-check-sub-btn" disabled title="批量检测订阅状态">
+                            🔍 检测订阅
+                        </button>
+                        <button class="btn btn-secondary" id="batch-pause-btn" disabled title="暂停当前批量任务">
+                            ⏸️ 暂停
+                        </button>
+                        <button class="btn btn-secondary" id="batch-resume-btn" disabled title="继续当前批量任务">
+                            ▶️ 继续
+                        </button>
+                        <div class="dropdown">
+                            <button class="btn btn-success" id="batch-upload-btn" disabled>
+                                ☁️ 上传
+                            </button>
+                            <div class="dropdown-menu" id="upload-menu">
+                                <a href="#" class="dropdown-item" id="batch-upload-cpa-item">☁️ 上传到 CPA</a>
+                                <a href="#" class="dropdown-item" id="batch-upload-sub2api-item">🔗 上传到 Sub2API</a>
+                                <a href="#" class="dropdown-item" id="batch-upload-codex2api-item">🔐 上传到 Codex2API</a>
+                                <a href="#" class="dropdown-item" id="batch-upload-tm-item">🚀 上传到 Team Manager</a>
+                                <a href="#" class="dropdown-item" id="batch-upload-new-api-item">🆕 上传到 new-api</a>
+                            </div>
+                        </div>
+                        <button class="btn btn-danger" id="batch-delete-btn" disabled>
+                            🗑️ 批量删除
+                        </button>
+                        <div class="dropdown">
+                            <button class="btn btn-primary" id="export-btn">
+                                📥 导出
+                            </button>
+                            <div class="dropdown-menu" id="export-menu">
+                                <a href="#" class="dropdown-item" data-format="json">导出 JSON</a>
+                                <a href="#" class="dropdown-item" data-format="csv">导出 CSV</a>
+                                <a href="#" class="dropdown-item" data-format="codex">导出 Codex 格式</a>
+                                <a href="#" class="dropdown-item" data-format="cpa">导出 CPA 格式</a>
+                                <a href="#" class="dropdown-item" data-format="sub2api">导出 Sub2Api 格式</a>
+                            </div>
+                        </div>
+                        <button class="btn btn-secondary" id="auto-quick-refresh-settings-btn" title="定时自动一键刷新设置">
+                            ⚙️ 定时
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 账号列表 -->
+            <div class="card">
+                <div class="card-body" style="padding: 0;">
+                    <div class="table-container">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th style="width: 40px;"><input type="checkbox" id="select-all"></th>
+                                    <th style="width: 60px;">ID</th>
+                                    <th>邮箱</th>
+                                    <th style="width: 100px;">密码</th>
+                                    <th style="width: 120px;">邮箱服务</th>
+                                    <th style="width: 80px;">状态</th>
+                                    <th style="width: 80px;">CPA</th>
+                                    <th style="width: 80px;">订阅</th>
+                                    <th style="width: 140px;">最后刷新</th>
+                                    <th style="width: 220px;">操作</th>
+                                </tr>
+                            </thead>
+                            <tbody id="accounts-table">
+                                <tr>
+                                    <td colspan="11">
+                                        <div class="empty-state">
+                                            <div class="skeleton skeleton-text" style="width: 60%;"></div>
+                                            <div class="skeleton skeleton-text" style="width: 80%;"></div>
+                                            <div class="skeleton skeleton-text" style="width: 40%;"></div>
+                                        </div>
+                                    </td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <!-- 分页 -->
+                    <div class="pagination" id="pagination">
+                        <button class="btn btn-secondary btn-sm" id="prev-page" disabled>
+                            ← 上一页
+                        </button>
+                        <span id="page-info">第 1 页 / 共 1 页</span>
+                        <button class="btn btn-secondary btn-sm" id="next-page">
+                            下一页 →
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- 详情模态框 -->
+    <div class="modal" id="detail-modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>📋 账号详情</h3>
+                <button class="modal-close" id="close-modal">&times;</button>
+            </div>
+            <div class="modal-body" id="modal-body">
+                <!-- 动态加载 -->
+            </div>
+        </div>
+    </div>
+
+    <!-- CPA 服务选择模态框 -->
+    <div class="modal" id="cpa-service-modal">
+        <div class="modal-content" style="max-width: 480px;">
+            <div class="modal-header">
+                <h3>☁️ 选择 CPA 服务</h3>
+                <button class="modal-close" id="close-cpa-modal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p style="color: var(--text-muted); margin-bottom: 12px; font-size: 0.9rem;">选择要上传到的 CPA 服务，或使用全局配置。</p>
+                <div id="cpa-service-list" style="display: flex; flex-direction: column; gap: 8px; max-height: 300px; overflow-y: auto;">
+                    <div style="text-align: center; color: var(--text-muted);">加载中...</div>
+                </div>
+            </div>
+            <div class="modal-footer" style="padding: 12px 20px; border-top: 1px solid var(--border); display: flex; gap: 8px; justify-content: flex-end;">
+                <button class="btn btn-secondary" id="cpa-use-global-btn">使用全局配置</button>
+                <button class="btn btn-secondary" id="cancel-cpa-modal-btn">取消</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Team Manager 服务选择模态框 -->
+    <div class="modal" id="tm-service-modal">
+        <div class="modal-content" style="max-width: 480px;">
+            <div class="modal-header">
+                <h3>🚀 选择 Team Manager 服务</h3>
+                <button class="modal-close" id="close-tm-modal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p style="color: var(--text-muted); margin-bottom: 12px; font-size: 0.9rem;">选择要上传到的 Team Manager 服务，或自动选择第一个启用的服务。</p>
+                <div id="tm-service-list" style="display: flex; flex-direction: column; gap: 8px; max-height: 300px; overflow-y: auto;">
+                    <div style="text-align: center; color: var(--text-muted);">加载中...</div>
+                </div>
+            </div>
+            <div class="modal-footer" style="padding: 12px 20px; border-top: 1px solid var(--border); display: flex; gap: 8px; justify-content: flex-end;">
+                <button class="btn btn-secondary" id="tm-use-auto-btn">自动选择</button>
+                <button class="btn btn-secondary" id="cancel-tm-modal-btn">取消</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Sub2API 服务选择模态框 -->
+    <div class="modal" id="sub2api-service-modal">
+        <div class="modal-content" style="max-width: 480px;">
+            <div class="modal-header">
+                <h3>🔗 选择 Sub2API 服务</h3>
+                <button class="modal-close" id="close-sub2api-modal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p style="color: var(--text-muted); margin-bottom: 12px; font-size: 0.9rem;">选择要上传到的 Sub2API 服务，或自动选择第一个启用的服务。</p>
+                <div id="sub2api-service-list" style="display: flex; flex-direction: column; gap: 8px; max-height: 300px; overflow-y: auto;">
+                    <div style="text-align: center; color: var(--text-muted);">加载中...</div>
+                </div>
+            </div>
+            <div class="modal-footer" style="padding: 12px 20px; border-top: 1px solid var(--border); display: flex; gap: 8px; justify-content: flex-end;">
+                <button class="btn btn-secondary" id="sub2api-use-auto-btn">自动选择</button>
+                <button class="btn btn-secondary" id="cancel-sub2api-modal-btn">取消</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Codex2API 服务选择模态框 -->
+    <div class="modal" id="codex2api-service-modal">
+        <div class="modal-content" style="max-width: 480px;">
+            <div class="modal-header">
+                <h3>🔐 选择 Codex2API 服务</h3>
+                <button class="modal-close" id="close-codex2api-modal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p style="color: var(--text-muted); margin-bottom: 12px; font-size: 0.9rem;">选择要上传到的 Codex2API 服务，或自动选择第一个启用的服务。</p>
+                <div id="codex2api-service-list" style="display: flex; flex-direction: column; gap: 8px; max-height: 300px; overflow-y: auto;">
+                    <div style="text-align: center; color: var(--text-muted);">加载中...</div>
+                </div>
+            </div>
+            <div class="modal-footer" style="padding: 12px 20px; border-top: 1px solid var(--border); display: flex; gap: 8px; justify-content: flex-end;">
+                <button class="btn btn-secondary" id="codex2api-use-auto-btn">自动选择</button>
+                <button class="btn btn-secondary" id="cancel-codex2api-modal-btn">取消</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 自动一键刷新设置 -->
+    <div class="modal" id="auto-quick-refresh-modal">
+        <div class="modal-content" style="max-width: 560px;">
+            <div class="modal-header">
+                <h3>⚙️ 定时自动一键刷新</h3>
+                <button class="modal-close" id="close-auto-quick-refresh-modal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="auto-quick-refresh-form">
+                    <div class="form-group field-full">
+                        <label class="auto-quick-refresh-check">
+                            <input type="checkbox" id="auto-quick-refresh-enabled">
+                            <span>启用定时自动一键刷新</span>
+                        </label>
+                    </div>
+                    <div class="form-group">
+                        <label>执行间隔</label>
+                        <select id="auto-quick-refresh-interval" class="form-select">
+                            <option value="5">每 5 分钟</option>
+                            <option value="10">每 10 分钟</option>
+                            <option value="15">每 15 分钟</option>
+                            <option value="30" selected>每 30 分钟</option>
+                            <option value="60">每 60 分钟</option>
+                            <option value="120">每 120 分钟</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>失败重试</label>
+                        <select id="auto-quick-refresh-retry" class="form-select">
+                            <option value="0">0 次</option>
+                            <option value="1">1 次</option>
+                            <option value="2" selected>2 次</option>
+                            <option value="3">3 次</option>
+                            <option value="4">4 次</option>
+                            <option value="5">5 次</option>
+                        </select>
+                    </div>
+                    <div class="form-group field-full">
+                        <label class="auto-quick-refresh-check">
+                            <input type="checkbox" id="auto-quick-refresh-run-now">
+                            <span>保存后立即执行一次</span>
+                        </label>
+                    </div>
+                </div>
+                <div class="auto-quick-refresh-runtime" id="auto-quick-refresh-runtime">
+                    日志加载中...
+                </div>
+            </div>
+            <div class="modal-footer" style="padding: 12px 20px; border-top: 1px solid var(--border); display: flex; gap: 8px; justify-content: flex-end;">
+                <button class="btn btn-secondary" id="cancel-auto-quick-refresh-btn">取消</button>
+                <button class="btn btn-primary" id="save-auto-quick-refresh-btn">保存</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/js/utils.js?v={{ static_version }}"></script>
+    <script src="/static/js/accounts.js?v={{ static_version }}"></script>
+    {% include "partials/site_footer.html" %}
+</body>
+</html>
+
+
+
+

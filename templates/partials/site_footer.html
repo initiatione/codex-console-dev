@@ -1,0 +1,25 @@
+{% set github_href = project_notice.get('github_repo_url', 'https://github.com/dou-jiang/codex-console') if project_notice else 'https://github.com/dou-jiang/codex-console' %}
+{% set blog_href = project_notice.get('blog_url', 'https://blog.cysq8.cn/') if project_notice else 'https://blog.cysq8.cn/' %}
+<footer class="site-footer-wrapper">
+    <div class="container">
+        <div class="site-footer">
+            <div class="site-footer-brand">
+                <span class="site-footer-kicker">项目链接</span>
+                <div class="site-footer-heading">
+                    <strong class="site-footer-title">Codex Console</strong>
+                    <span class="site-footer-text">项目入口与文档导航</span>
+                </div>
+            </div>
+            <div class="site-footer-actions">
+                <a class="site-footer-link" href="{{ github_href }}" data-external-url="{{ github_href }}" rel="noopener noreferrer" onclick="event.preventDefault(); event.stopPropagation(); window.open(this.getAttribute('data-external-url') || this.href, '_blank', 'noopener,noreferrer'); return false;">
+                    <span class="site-footer-link-label">GitHub</span>
+                    <span class="site-footer-link-sub">仓库、问题反馈、版本发布</span>
+                </a>
+                <a class="site-footer-link site-footer-link-blog" href="{{ blog_href }}" data-external-url="{{ blog_href }}" rel="noopener noreferrer" onclick="event.preventDefault(); event.stopPropagation(); window.open(this.getAttribute('data-external-url') || this.href, '_blank', 'noopener,noreferrer'); return false;">
+                    <span class="site-footer-link-label">Blog</span>
+                    <span class="site-footer-link-sub">教程文章、更新说明、部署记录</span>
+                </a>
+            </div>
+        </div>
+    </div>
+</footer>

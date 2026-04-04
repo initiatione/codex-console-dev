@@ -1,0 +1,119 @@
+name: Multi-platform Build Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version tag, for example v1.0.0"
+        required: false
+        default: "dev"
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            source_name: codex-console.exe
+            asset_name: codex-console-windows-x64.exe
+          - os: ubuntu-latest
+            source_name: codex-console
+            asset_name: codex-console-linux-x64
+          - os: ubuntu-24.04-arm
+            source_name: codex-console
+            asset_name: codex-console-linux-arm64
+          - os: macos-latest
+            source_name: codex-console
+            asset_name: codex-console-macos-arm64
+          - os: macos-26-intel
+            source_name: codex-console
+            asset_name: codex-console-macos-amd64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build binary
+        run: |
+          pyinstaller codex_register.spec --clean --noconfirm
+
+      - name: Rename packaged binary
+        shell: bash
+        run: |
+          mv "dist/${{ matrix.source_name }}" "dist/${{ matrix.asset_name }}"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: dist/${{ matrix.asset_name }}
+          if-no-files-found: error
+
+  release:
+    name: Create release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          body: |
+            ## codex-console
+
+            ### Download
+            | Platform | File |
+            |------|------|
+            | Windows x64 | `codex-console-windows-x64.exe` |
+            | Linux ARM64 | `codex-console-linux-arm64` |
+            | Linux x64 | `codex-console-linux-x64` |
+            | macOS ARM64 | `codex-console-macos-arm64` |
+            | macOS AMD64 | `codex-console-macos-amd64` |
+
+            ### Usage
+            ```bash
+            # Linux/macOS may need execute permission first
+            chmod +x codex-console-*
+
+            # Start Web UI
+            ./codex-console
+
+            # Custom port
+            ./codex-console --port 8080
+
+            # Debug mode
+            ./codex-console --debug
+
+            # Set Web UI password
+            ./codex-console --access-password mypassword
+            ```

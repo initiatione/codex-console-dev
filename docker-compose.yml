@@ -1,0 +1,53 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=codex_user
+      - POSTGRES_PASSWORD=codex_pass
+      - POSTGRES_DB=codex
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U codex_user -d codex"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - ./pgdata:/var/lib/postgresql/data
+
+  webui:
+    build: .
+    shm_size: "1gb"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "1455:1455"
+      - "6080:6080"
+      # 如需使用 VNC 客户端直连可打开：
+      # - "5900:5900"
+    environment:
+      - WEBUI_HOST=0.0.0.0
+      - WEBUI_PORT=1455
+      - DISPLAY=:99
+      - ENABLE_VNC=1
+      - VNC_PORT=5900
+      - NOVNC_PORT=6080
+      - DEBUG=0
+      - LOG_LEVEL=info
+      - APP_DATABASE_URL=postgresql://codex_user:codex_pass@postgres:5432/codex
+      - APP_DB_POOL_SIZE=20
+      - APP_DB_MAX_OVERFLOW=20
+      - APP_DB_POOL_TIMEOUT=30
+      - APP_DB_POOL_RECYCLE=1800
+      - APP_DB_POOL_USE_LIFO=true
+      # 如果需要访问密码，可以在这里取消注释并设置
+      - WEBUI_ACCESS_PASSWORD=admin123
+    volumes:
+      # 挂载数据目录以持久化应用数据和日志
+      - ./data:/app/data
+      - ./logs:/app/logs
+    restart: unless-stopped

@@ -1,0 +1,43 @@
+{% if project_notice %}
+{% set github_href = project_notice.get('github_repo_url', 'https://github.com/dou-jiang/codex-console') %}
+{% set blog_href = project_notice.get('blog_url', 'https://blog.cysq8.cn/') %}
+{% set qq_href = project_notice.get('qq_group_url', 'https://qm.qq.com/q/4TETC3mWco') %}
+{% set telegram_href = project_notice.get('telegram_url', 'https://t.me/codex_console') %}
+{% set afdian_href = project_notice.get('afdian_url', 'https://afdian.com/a/dou-jiang') %}
+<div class="site-notice-wrapper">
+    <div class="container">
+        <section class="site-notice" role="note" aria-label="{{ project_notice.title }}">
+            <p class="site-notice-text site-notice-lead">
+                <strong>{{ project_notice.title }}</strong>
+                {{ project_notice.free_notice }}
+            </p>
+            <p class="site-notice-text">{{ project_notice.disclaimer }}</p>
+            {% if project_notice.support_notice %}
+            <p class="site-notice-text">{{ project_notice.support_notice }}</p>
+            {% endif %}
+            <div class="site-notice-links">
+                <a class="site-notice-link" href="{{ github_href }}" data-external-url="{{ github_href }}" rel="noopener noreferrer" onclick="event.preventDefault(); event.stopPropagation(); window.open(this.getAttribute('data-external-url') || this.href, '_blank', 'noopener,noreferrer'); return false;">
+                    <span class="site-notice-link-title">GitHub 仓库</span>
+                    <span class="site-notice-link-meta">{{ github_href }}</span>
+                </a>
+                <a class="site-notice-link site-notice-link-featured" href="{{ blog_href }}" data-external-url="{{ blog_href }}" rel="noopener noreferrer" onclick="event.preventDefault(); event.stopPropagation(); window.open(this.getAttribute('data-external-url') || this.href, '_blank', 'noopener,noreferrer'); return false;">
+                    <span class="site-notice-link-title">Blog 文档</span>
+                    <span class="site-notice-link-meta">教程文章、更新说明、部署记录</span>
+                </a>
+                <a class="site-notice-link" href="{{ qq_href }}" data-external-url="{{ qq_href }}" rel="noopener noreferrer" onclick="event.preventDefault(); event.stopPropagation(); window.open(this.getAttribute('data-external-url') || this.href, '_blank', 'noopener,noreferrer'); return false;">
+                    <span class="site-notice-link-title">QQ 交流</span>
+                    <span class="site-notice-link-meta">{{ project_notice.qq_group_id }}，点击加群</span>
+                </a>
+                <a class="site-notice-link" href="{{ telegram_href }}" data-external-url="{{ telegram_href }}" rel="noopener noreferrer" onclick="event.preventDefault(); event.stopPropagation(); window.open(this.getAttribute('data-external-url') || this.href, '_blank', 'noopener,noreferrer'); return false;">
+                    <span class="site-notice-link-title">Telegram 频道</span>
+                    <span class="site-notice-link-meta">{{ project_notice.telegram_name }}</span>
+                </a>
+                <a class="site-notice-link site-notice-link-accent" href="{{ afdian_href }}" data-external-url="{{ afdian_href }}" rel="noopener noreferrer" onclick="event.preventDefault(); event.stopPropagation(); window.open(this.getAttribute('data-external-url') || this.href, '_blank', 'noopener,noreferrer'); return false;">
+                    <span class="site-notice-link-title">爱发电支持</span>
+                    <span class="site-notice-link-meta">项目维护不易，欢迎赞助</span>
+                </a>
+            </div>
+        </section>
+    </div>
+</div>
+{% endif %}
