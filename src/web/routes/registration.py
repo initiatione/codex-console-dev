@@ -12,7 +12,9 @@ from datetime import datetime, timezone
 from typing import List, Optional, Dict, Tuple, Any, Callable
 
 from fastapi import APIRouter, HTTPException, Query, BackgroundTasks
-from sqlalchemy import func
+from sqlalchemy import func, inspect as sa_inspect
+from sqlalchemy.orm.exc import DetachedInstanceError
+from sqlalchemy.orm.state import NO_VALUE
 from pydantic import BaseModel, ConfigDict, Field
 
 from ...config.constants import (
@@ -409,10 +411,64 @@ def _get_task_recovery_reason(task: RegistrationTask) -> Optional[str]:
     return None
 
 
-def task_to_response(task: RegistrationTask) -> RegistrationTaskResponse:
-    """转换任务模型为响应"""
+def _get_task_email_service_snapshot(task: RegistrationTask) -> Tuple[Optional[str], Optional[str]]:
+    """安全提取任务关联邮箱服务信息，避免 detached 实例触发懒加载。"""
+    task_dict = getattr(task, "__dict__", {})
+    cached_email_service = task_dict.get("email_service")
+    if cached_email_service is not None:
+        return (
+            getattr(cached_email_service, "name", None),
+            getattr(cached_email_service, "service_type", None),
+        )
+
+    try:
+        task_state = sa_inspect(task)
+        email_service_attr = task_state.attrs.email_service
+        loaded_email_service = email_service_attr.loaded_value
+    except Exception:
+        return None, None
+
+    if loaded_email_service is NO_VALUE and task_state.detached:
+        return None, None
+
+    try:
+        email_service = loaded_email_service if loaded_email_service is not NO_VALUE else email_service_attr.value
+    except DetachedInstanceError:
+        return None, None
+
+    return (
+        getattr(email_service, "name", None),
+        getattr(email_service, "service_type", None),
+    )
+
+
+
+def _get_email_service_snapshot_by_id(db, email_service_id: Optional[int]) -> Tuple[Optional[str], Optional[str]]:
+    """按邮箱服务 ID 提取稳定快照，供会话内响应构造复用。"""
+    if not email_service_id:
+        return None, None
+    email_service = crud.get_email_service_by_id(db, email_service_id)
+    if not email_service:
+        return None, None
+    return email_service.name, email_service.service_type
+
+
+
+def task_to_response(
+    task: RegistrationTask,
+    email_service_name: Optional[str] = None,
+    email_service_type: Optional[str] = None,
+) -> RegistrationTaskResponse:
+    """转换任务模型为响应。"""
     recovery_reason = _get_task_recovery_reason(task)
-    email_service = getattr(task, "email_service", None)
+    resolved_email_service_name = email_service_name
+    resolved_email_service_type = email_service_type
+    if resolved_email_service_name is None or resolved_email_service_type is None:
+        snapshot_name, snapshot_type = _get_task_email_service_snapshot(task)
+        if resolved_email_service_name is None:
+            resolved_email_service_name = snapshot_name
+        if resolved_email_service_type is None:
+            resolved_email_service_type = snapshot_type
     return RegistrationTaskResponse(
         id=task.id,
         task_uuid=task.task_uuid,
@@ -424,8 +480,8 @@ def task_to_response(task: RegistrationTask) -> RegistrationTaskResponse:
         error_message=task.error_message,
         recovered_on_startup=bool(recovery_reason),
         recovery_reason=recovery_reason,
-        email_service_name=getattr(email_service, "name", None),
-        email_service_type=getattr(email_service, "service_type", None),
+        email_service_name=resolved_email_service_name,
+        email_service_type=resolved_email_service_type,
         created_at=task.created_at.isoformat() if task.created_at else None,
         started_at=task.started_at.isoformat() if task.started_at else None,
         completed_at=task.completed_at.isoformat() if task.completed_at else None,
@@ -1589,7 +1645,7 @@ async def run_auto_registration_batch(plan, settings: Settings) -> str:
     await run_batch_registration(
         batch_id=batch_id,
         task_uuids=task_uuids,
-        email_service_type=email_service_type,
+        email_service_type=resolved_email_service_type,
         proxy=proxy,
         email_service_config=None,
         email_service_id=email_service_id,
@@ -1692,7 +1748,14 @@ async def _start_single_registration_internal(
         task = crud.create_registration_task(
             db,
             task_uuid=task_uuid,
+            email_service_id=request.email_service_id,
             proxy=request.proxy,
+        )
+        email_service_name, email_service_type = _get_email_service_snapshot_by_id(db, request.email_service_id)
+        response = task_to_response(
+            task,
+            email_service_name=email_service_name,
+            email_service_type=email_service_type,
         )
 
     _schedule_async_job(
@@ -1718,8 +1781,7 @@ async def _start_single_registration_internal(
         request.filter_only_access_token_accounts,
         request.registration_type,
     )
-    return task_to_response(task)
-
+    return response
 
 async def _start_batch_registration_internal(
     request: BatchRegistrationRequest,
@@ -1742,19 +1804,26 @@ async def _start_batch_registration_internal(
 
     batch_id = str(uuid.uuid4())
     task_uuids = []
+    task_responses: List[RegistrationTaskResponse] = []
 
     with get_db() as db:
+        email_service_name, email_service_type = _get_email_service_snapshot_by_id(db, request.email_service_id)
         for _ in range(request.count):
             task_uuid = str(uuid.uuid4())
-            crud.create_registration_task(
+            task = crud.create_registration_task(
                 db,
                 task_uuid=task_uuid,
+                email_service_id=request.email_service_id,
                 proxy=request.proxy,
             )
             task_uuids.append(task_uuid)
-
-    with get_db() as db:
-        tasks = [crud.get_registration_task(db, item_uuid) for item_uuid in task_uuids]
+            task_responses.append(
+                task_to_response(
+                    task,
+                    email_service_name=email_service_name,
+                    email_service_type=email_service_type,
+                )
+            )
 
     _schedule_async_job(
         background_tasks,
@@ -1786,9 +1855,8 @@ async def _start_batch_registration_internal(
     return BatchRegistrationResponse(
         batch_id=batch_id,
         count=request.count,
-        tasks=[task_to_response(task) for task in tasks if task],
+        tasks=task_responses,
     )
-
 
 async def _start_outlook_batch_registration_internal(
     request: OutlookBatchRegistrationRequest,
@@ -1936,7 +2004,7 @@ async def dispatch_registration_config(
     if reg_mode == 'batch':
         request = BatchRegistrationRequest(
             count=int(config.get('batch_count') or 1),
-            email_service_type=email_service_type,
+            email_service_type=resolved_email_service_type,
             proxy=config.get('proxy'),
             email_service_config=config.get('email_service_config'),
             email_service_id=config.get('email_service_id'),
@@ -1964,7 +2032,7 @@ async def dispatch_registration_config(
         }
 
     request = RegistrationTaskCreate(
-        email_service_type=email_service_type,
+        email_service_type=resolved_email_service_type,
         proxy=config.get('proxy'),
         email_service_config=config.get('email_service_config'),
         email_service_id=config.get('email_service_id'),

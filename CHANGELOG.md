@@ -2,6 +2,14 @@
 
 ## v1.1.3
 
+- 优化注册任务启动响应构造：单任务/普通批量启动现会在数据库会话仍存活时生成响应快照并回填已选 `email_service_id`，减少 detached ORM 对象往返与批量启动后的重复查询，响应字段更稳定。
+- 新增 `scripts/repair_codex_desktop.ps1`：提供可回滚的 Codex Desktop 本地修复脚本，会先检查桌面版是否已退出，再把超大的 `.codex` SQLite 状态库、桌面版日志目录与 Electron 缓存迁移到工作区 `artifacts/codex-desktop-repair/<timestamp>/` 备份后重建。
+
+- 记录 Codex Desktop 闪退/卡死排查结论：当前用户目录里 `.codex/logs_1.sqlite` 约 1.94 GB、`.codex/state_5.sqlite` 约 0.84 GB、桌面版 `LocalCache/Local/Codex/Logs` 约 1.87 GB，且历史日志存在多次 `git diff` 输出超限与 `MoAppHang` 事件，优先按“备份并清理超大状态/日志文件”处理。
+
+
+- 修复注册任务响应序列化回归：`task_to_response()` 现对 detached 的 SQLAlchemy `RegistrationTask` 实例做安全快照，避免在 Session 已关闭时访问 `email_service` 懒加载关系而触发 `DetachedInstanceError`；并补充对应回归测试。
+
 - 重组 `docs/DEPLOYMENT.md` 结构：按“本地部署 / 服务器部署”两大场景重新编排，方便按用途快速查阅，并保留原有迁移、备份、自检与端口约定。
 
 - 整理当前部署说明：新增 `docs/DEPLOYMENT.md`，集中说明本地 SQLite、本地启动器、外部 PostgreSQL、Docker Compose、端口约定、持久化目录、备份与迁移步骤，并在 `README.md` 增加文档入口。
