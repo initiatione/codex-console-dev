@@ -55,6 +55,12 @@
 
 本仓库是在原项目思路和结构之上进行兼容性修复、流程调整和体验优化，适合作为一个“当前可用的修复维护版”继续使用。
 
+## 开源共享说明
+
+- 仓库前面的项目地址、Blog、社群、赞助与致谢信息会继续保留，并作为 README 的重点信息长期展示。
+- 本仓库定位仍然是基于上游持续修复、持续维护的开源共享版本，方便直接使用、排障和二次开发。
+- 如果你是通过第三方付费获取本项目，建议优先回到仓库与 Blog 核对原始说明，避免被二次倒卖或拿过时版本。
+
 ## 版本更新
 
 ### v1.0
@@ -187,10 +193,16 @@
 - 支持打包为 Windows / Linux / macOS 可执行文件
 - 更适配当前 OpenAI 注册与登录链路
 
+## 部署说明
+
+- 完整部署说明已整理到：[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)
+- 如果你只想快速启动，本地推荐直接看 `python start_webui.py` 这一套；容器部署则优先看 `docker compose up -d`。
+
 ## 环境要求
 
 - Python 3.10+
 - `uv`（推荐）或 `pip`
+- 如需使用推荐启动器 / Docker Compose，请先安装 Docker
 
 ## 安装依赖
 
@@ -202,7 +214,51 @@ uv sync
 pip install -r requirements.txt
 ```
 
-## 环境变量配置
+## 快速开始
+
+### 1）本地快速体验（SQLite）
+
+```bash
+python webui.py
+```
+
+- 默认访问：`http://127.0.0.1:8000`
+- 默认数据库：`data/database.db`
+- 适合单机测试、快速体验
+
+### 2）Windows / 本地开发推荐方式
+
+```bash
+python start_webui.py
+```
+
+- 推荐组合：`Docker PostgreSQL + 本机 python webui.py`
+- 启动器会优先检查 `.env` 中的 PostgreSQL 配置
+- 数据库不可达时会自动尝试 `docker compose up -d postgres`
+- 会自动选择可用端口并在服务可访问后打开浏览器
+
+常用参数：
+
+- `python start_webui.py --dry-run`
+- `python start_webui.py --skip-docker`
+- `python start_webui.py --no-browser`
+- `python start_webui.py --port 8080`
+
+### 3）Docker Compose 部署
+
+```bash
+docker compose up -d
+```
+
+默认入口：
+
+- Web UI：`http://127.0.0.1:1455`
+- noVNC：`http://127.0.0.1:6080`
+- PostgreSQL：`127.0.0.1:5432`
+
+> 注意：本地 `python webui.py` 默认端口是 `8000`，`docker compose` 默认端口是 `1455`。
+
+## 常用环境变量
 
 可选。复制 `.env.example` 为 `.env` 后按需修改：
 
@@ -210,170 +266,39 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-常用变量如下：
+常用变量：
 
 | 变量 | 说明 | 默认值 |
 | --- | --- | --- |
-| `APP_HOST` | 监听主机 | `0.0.0.0` |
-| `APP_PORT` | 监听端口 | `8000` |
+| `APP_HOST` | Web UI 监听主机 | `0.0.0.0` |
+| `APP_PORT` | Web UI 监听端口 | `8000` |
 | `APP_ACCESS_PASSWORD` | Web UI 访问密钥 | `admin123` |
-| `APP_DATABASE_URL` | 数据库连接字符串（PostgreSQL 推荐） | `postgresql://codex_user:codex_pass@postgres:5432/codex` |
-| `APP_DB_POOL_SIZE` | 数据库连接池常驻连接数（PostgreSQL/MySQL） | `20` |
-| `APP_DB_MAX_OVERFLOW` | 额外连接数（突破 `APP_DB_POOL_SIZE`） | `20` |
-| `APP_DB_POOL_TIMEOUT` | 等待连接超时时间（秒） | `30` |
+| `APP_DATABASE_URL` | 数据库连接字符串 | `postgresql://codex_user:codex_pass@postgres:5432/codex` |
+| `APP_DB_POOL_SIZE` | 连接池常驻连接数 | `20` |
+| `APP_DB_MAX_OVERFLOW` | 额外连接数 | `20` |
+| `APP_DB_POOL_TIMEOUT` | 等待连接超时（秒） | `30` |
 | `APP_DB_POOL_RECYCLE` | 连接回收时间（秒） | `1800` |
-| `APP_DB_POOL_USE_LIFO` | 连接池是否优先复用最近归还连接 | `true` |
+| `APP_DB_POOL_USE_LIFO` | 是否优先复用最近归还连接 | `true` |
 
-优先级：
+优先级：`命令行参数 > 环境变量(.env) > 数据库设置 > 默认值`
 
-`命令行参数 > 环境变量(.env) > 数据库设置 > 默认值`
+## 部署 / 迁移 / 备份说明
 
-## 启动 Web UI
+为避免 README 重复过长，详细内容已集中到这些文档：
 
-```bash
-# 默认启动（127.0.0.1:8000）
-python webui.py
+- 完整部署说明：[`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)
+- Alembic 迁移说明：[`alembic/README.md`](alembic/README.md)
+- SQLite 迁移到 PostgreSQL：`python scripts/migrate_sqlite_to_postgres.py --source data/database.db --target <postgresql_url>`
 
-# 指定地址和端口
-python webui.py --host 0.0.0.0 --port 8080
+`docs/DEPLOYMENT.md` 已整理这些内容：
 
-# 调试模式（热重载）
-python webui.py --debug
-
-# 设置 Web UI 访问密钥
-python webui.py --access-password mypassword
-
-# 组合参数
-python webui.py --host 0.0.0.0 --port 8080 --access-password mypassword
-```
-
-说明：
-
-- `--access-password` 的优先级高于数据库中的密钥设置
-- 该参数只对本次启动生效
-- 打包后的 exe 也支持这个参数
-
-例如：
-
-```bash
-codex-console.exe --access-password mypassword
-```
-
-启动后访问：
-
-[http://127.0.0.1:8000](http://127.0.0.1:8000)
-
-### 推荐启动方式（Windows / 本地开发）
-
-如果你本地采用当前推荐方式运行：`Docker PostgreSQL + python webui.py`，可以直接使用根目录启动器：
-
-```bash
-python start_webui.py
-```
-
-它会自动完成这些动作：
-
-- 检查 `.env` 中是否已指向 PostgreSQL
-- 自动执行 `docker compose up -d postgres`
-- 等待数据库容器就绪
-- 自动选择一个可用端口并启动 `webui.py`
-- 在服务可访问后自动打开浏览器
-
-常用参数：
-
-- `python start_webui.py --dry-run`：只检查流程，不真正启动
-- `python start_webui.py --skip-docker`：跳过 Docker/PostgreSQL 自动启动
-- `python start_webui.py --no-browser`：启动后不自动打开浏览器
-- `python start_webui.py --port 8080`：指定本次启动端口
-
-## Docker 部署
-
-### 使用 docker-compose
-
-```bash
-docker-compose up -d
-```
-
-默认 compose 已经自带一个 PostgreSQL 服务，并通过健康检查确保 Web UI 在数据库可用后再启动。
-`APP_DATABASE_URL`、`APP_DB_POOL_SIZE`、`APP_DB_MAX_OVERFLOW`、`APP_DB_POOL_TIMEOUT`、`APP_DB_POOL_RECYCLE` 和 `APP_DB_POOL_USE_LIFO` 会自动注入 Web UI。
-如果你要接外部 PostgreSQL，请把 `APP_DATABASE_URL` 改成目标实例，并按需移除或覆盖 compose 里的 `postgres` 服务定义。
-默认 compose 同时把 PostgreSQL 绑定到宿主机 `127.0.0.1:5432`，便于本机执行迁移脚本或直接运行 `python webui.py` 连接这套数据库。
-如果需要看“全自动绑卡”的可视化浏览器，打开：
-
-- noVNC: `http://127.0.0.1:6080`
-
-### 使用 docker run
-
-```bash
-docker run -d \
-  -p 1455:1455 \
-  -p 6080:6080 \
-  -e DISPLAY=:99 \
-  -e ENABLE_VNC=1 \
-  -e VNC_PORT=5900 \
-  -e NOVNC_PORT=6080 \
-  -e WEBUI_HOST=0.0.0.0 \
-  -e WEBUI_PORT=1455 \
-  -e WEBUI_ACCESS_PASSWORD=your_secure_password \
-  -v $(pwd)/data:/app/data \
-  --name codex-console \
-  ghcr.io/<yourname>/codex-console:latest
-```
-
-说明：
-
-- `WEBUI_HOST`: 监听主机，默认 `0.0.0.0`
-- `WEBUI_PORT`: 监听端口，默认 `1455`
-- `WEBUI_ACCESS_PASSWORD`: Web UI 访问密码
-- `DEBUG`: 设为 `1` 或 `true` 可开启调试模式
-- `LOG_LEVEL`: 日志级别，例如 `info`、`debug`
-
-注意：
-
-`-v $(pwd)/data:/app/data` 很重要，这会把数据库和账号数据持久化到宿主机。否则容器一重启，数据也可能跟着表演消失术。
-
-## 使用远程 PostgreSQL
-
-```bash
-export APP_DATABASE_URL="postgresql://user:password@host:5432/dbname"
-export APP_DB_POOL_SIZE=20
-export APP_DB_MAX_OVERFLOW=20
-export APP_DB_POOL_TIMEOUT=30
-export APP_DB_POOL_RECYCLE=1800
-export APP_DB_POOL_USE_LIFO=true
-python webui.py
-```
-
-也支持 `DATABASE_URL`，但优先级低于 `APP_DATABASE_URL`。
-如果你是从默认 SQLite 切换过来，现有 `data/database.db` 不会自动迁移到 PostgreSQL，需要你自行导入历史数据。
-
-可以直接执行：
-
-```bash
-docker compose up -d postgres
-python scripts/migrate_sqlite_to_postgres.py --source data/database.db --target postgresql://codex_user:codex_pass@127.0.0.1:5432/codex
-```
-
-### PostgreSQL 数据目录与备份建议
-
-`pgdata/` 是 Docker Compose 挂载到宿主机的 PostgreSQL 数据目录，只负责本地持久化，不建议提交到 Git，也不要在 PostgreSQL 运行中手动复制里面的文件做热备份。
-建议把备份文件放到已忽略的 `backups/` 目录，并优先使用 `pg_dump` / `pg_restore`：
-
-```bash
-docker compose up -d postgres
-mkdir backups
-docker compose exec postgres sh -c "pg_dump -U codex_user -d codex -Fc -f /tmp/codex.dump"
-docker cp <postgres-container>:/tmp/codex.dump backups/codex.dump
-```
-
-恢复时可以执行：
-
-```bash
-docker cp backups/codex.dump <postgres-container>:/tmp/codex.dump
-docker compose exec postgres sh -c "pg_restore -U codex_user -d codex --clean --if-exists /tmp/codex.dump"
-```
-
-如果你确实要直接复制 `pgdata/` 做冷备份，请先停止 `postgres` 容器，再整体复制该目录。
+- 本地 SQLite 启动
+- `start_webui.py` 推荐启动方式
+- 外部 PostgreSQL 部署
+- Docker Compose / Docker run
+- 端口与持久化目录约定
+- 备份与恢复步骤
+- 常见部署误区
 
 ## 打包为可执行文件
 
