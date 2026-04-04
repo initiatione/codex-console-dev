@@ -654,11 +654,27 @@ async function testService(id) {
 
 // 删除服务
 async function deleteService(id, name) {
-    const confirmed = await confirm(`确定要删除 "${name}" 吗？`);
+    let confirmMessage = `确定要删除 "${name}" 吗？`;
+    try {
+        const impact = await api.get(`/email-services/${id}/delete-impact`);
+        if ((impact.active_reference_count || 0) > 0) {
+            toast.error(`删除失败：该服务仍关联 ${impact.active_reference_count} 个执行中注册任务，请先处理活动任务。`);
+            return;
+        }
+        if ((impact.deletable_task_count || 0) > 0) {
+            confirmMessage = (impact.pending_reference_count || 0) > 0 ? `确定要删除 "${name}" 吗？将同时删除 ${impact.deletable_task_count} 条关联注册记录（含 ${impact.pending_reference_count} 条待执行任务）。` : `确定要删除 "${name}" 吗？将同时删除 ${impact.deletable_task_count} 条关联注册记录。`;
+        } else {
+            confirmMessage = `确定要删除 "${name}" 吗？当前没有关联注册记录。`;
+        }
+    } catch (error) {
+        console.warn("获取邮箱服务删除影响失败:", error);
+        confirmMessage = `确定要删除 "${name}" 吗？关联的注册记录也会一并删除。`;
+    }
+    const confirmed = await confirm(confirmMessage);
     if (!confirmed) return;
     try {
-        await api.delete(`/email-services/${id}`);
-        toast.success('已删除');
+        const result = await api.delete(`/email-services/${id}`);
+        toast.success(result.message || '已删除');
         selectedOutlook.delete(id);
         selectedCustom.delete(id);
         loadOutlookServices();

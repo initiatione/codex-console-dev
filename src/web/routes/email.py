@@ -1,4 +1,4 @@
-﻿"""
+"""
 邮箱服务配置 API 路由
 """
 
@@ -17,6 +17,7 @@ from ...database.models import Account as AccountModel
 from ...database.models import RegistrationTask as RegistrationTaskModel
 from ...config.settings import get_settings
 from ...services import EmailServiceFactory, EmailServiceType
+from ..task_manager import task_manager
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -516,6 +517,55 @@ async def update_email_service(service_id: int, request: EmailServiceUpdate):
         return service_to_response(service)
 
 
+
+def _get_email_service_delete_impact(db, service_id: int) -> Dict[str, int]:
+    """获取删除邮箱服务前的关联注册任务影响统计"""
+    total_reference_count = (
+        db.query(func.count(RegistrationTaskModel.id))
+        .filter(RegistrationTaskModel.email_service_id == service_id)
+        .scalar()
+        or 0
+    )
+    running_reference_count = (
+        db.query(func.count(RegistrationTaskModel.id))
+        .filter(
+            RegistrationTaskModel.email_service_id == service_id,
+            RegistrationTaskModel.status == "running",
+        )
+        .scalar()
+        or 0
+    )
+    pending_reference_count = (
+        db.query(func.count(RegistrationTaskModel.id))
+        .filter(
+            RegistrationTaskModel.email_service_id == service_id,
+            RegistrationTaskModel.status == "pending",
+        )
+        .scalar()
+        or 0
+    )
+    return {
+        "total_reference_count": total_reference_count,
+        "active_reference_count": running_reference_count,
+        "running_reference_count": running_reference_count,
+        "pending_reference_count": pending_reference_count,
+        "deletable_task_count": max(total_reference_count - running_reference_count, 0),
+    }
+
+
+@router.get("/{service_id}/delete-impact")
+async def get_email_service_delete_impact(service_id: int):
+    """获取删除邮箱服务前的影响统计"""
+    with get_db() as db:
+        service = db.query(EmailServiceModel).filter(EmailServiceModel.id == service_id).first()
+        if not service:
+            raise HTTPException(status_code=404, detail="服务不存在")
+
+        impact = _get_email_service_delete_impact(db, service_id)
+        impact["service_id"] = service.id
+        impact["service_name"] = service.name
+        return impact
+
 @router.delete("/{service_id}")
 async def delete_email_service(service_id: int):
     """删除邮箱服务配置"""
@@ -523,18 +573,31 @@ async def delete_email_service(service_id: int):
         service = db.query(EmailServiceModel).filter(EmailServiceModel.id == service_id).first()
         if not service:
             raise HTTPException(status_code=404, detail="服务不存在")
-
-        reference_count = (
-            db.query(func.count(RegistrationTaskModel.id))
-            .filter(RegistrationTaskModel.email_service_id == service_id)
-            .scalar()
-            or 0
-        )
-        if reference_count > 0:
+        impact = _get_email_service_delete_impact(db, service_id)
+        running_reference_count = impact["running_reference_count"]
+        if running_reference_count > 0:
             raise HTTPException(
                 status_code=409,
-                detail=f"服务 {service.name} 已被 {reference_count} 个注册任务引用，无法删除。请先清理相关任务记录，或改为禁用该服务。"
+                detail=f"服务 {service.name} 仍被 {running_reference_count} 个执行中注册任务引用，无法删除。请先取消或删除相关任务后重试。"
             )
+
+        pending_task_uuids = [
+            task_uuid
+            for (task_uuid,) in db.query(RegistrationTaskModel.task_uuid)
+            .filter(
+                RegistrationTaskModel.email_service_id == service_id,
+                RegistrationTaskModel.status == "pending",
+            )
+            .all()
+        ]
+        for task_uuid in pending_task_uuids:
+            task_manager.cancel_task(task_uuid)
+
+        deleted_task_count = (
+            db.query(RegistrationTaskModel)
+            .filter(RegistrationTaskModel.email_service_id == service_id)
+            .delete(synchronize_session=False)
+        )
 
         try:
             db.delete(service)
@@ -546,7 +609,11 @@ async def delete_email_service(service_id: int):
                 detail="该邮箱服务仍被其他数据引用，暂时不能删除。请先解除引用后重试。"
             ) from exc
 
-        return {"success": True, "message": f"服务 {service.name} 已删除"}
+        message = f"服务 {service.name} 已删除"
+        if deleted_task_count > 0:
+            message = f"已删除 {deleted_task_count} 条关联注册记录，并删除服务 {service.name}"
+
+        return {"success": True, "message": message}
 
 @router.post("/{service_id}/test", response_model=ServiceTestResult)
 async def test_email_service(service_id: int):
