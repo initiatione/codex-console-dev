@@ -13,6 +13,7 @@ import webbrowser
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
+from urllib.parse import urlparse
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 LOGS_DIR = PROJECT_ROOT / "logs"
@@ -23,6 +24,27 @@ DOCKER_DESKTOP_EXE = Path(r"C:\Program Files\Docker\Docker\Docker Desktop.exe")
 class LaunchError(RuntimeError):
     pass
 
+
+def parse_database_endpoint(database_url: str) -> tuple[str, int] | None:
+    normalized = str(database_url or "").strip()
+    if not normalized.startswith(("postgres://", "postgresql://", "postgresql+psycopg://")):
+        return None
+
+    parsed = urlparse(normalized)
+    host = parsed.hostname
+    if not host:
+        return None
+
+    port = parsed.port or 5432
+    return host, port
+
+
+def can_connect_tcp(host: str, port: int, timeout_seconds: float = 1.5) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout_seconds):
+            return True
+    except OSError:
+        return False
 
 def log(message: str, level: str = "INFO") -> None:
     LOGS_DIR.mkdir(exist_ok=True)
@@ -109,13 +131,32 @@ def ensure_docker_daemon(timeout_seconds: int) -> None:
     raise LaunchError("等待 Docker daemon 超时，请确认 Docker Desktop 已完全启动。")
 
 
-def ensure_postgres_service(service_name: str, timeout_seconds: int, dry_run: bool) -> None:
+def ensure_postgres_service(
+    service_name: str,
+    timeout_seconds: int,
+    dry_run: bool,
+    database_endpoint: tuple[str, int] | None = None,
+) -> None:
     if dry_run:
         log(f"[dry-run] 将执行: docker compose up -d {service_name}")
         log(f"[dry-run] 将等待服务 {service_name} 进入 healthy/running")
         return
 
-    run_command(["docker", "compose", "up", "-d", service_name], capture_output=True)
+    try:
+        run_command(["docker", "compose", "up", "-d", service_name], capture_output=True)
+    except LaunchError as exc:
+        if (
+            database_endpoint
+            and "port is already allocated" in str(exc)
+            and can_connect_tcp(database_endpoint[0], database_endpoint[1])
+        ):
+            log(
+                f"检测到数据库端口已被占用，但目标数据库已经可直连，沿用现有实例继续启动: {database_endpoint[0]}:{database_endpoint[1]}",
+                "WARN",
+            )
+            return
+        raise
+
     container_id = run_command(["docker", "compose", "ps", "-q", service_name], capture_output=True).stdout.strip()
     if not container_id:
         raise LaunchError(f"未找到服务 {service_name} 对应的容器，请检查 docker-compose.yml。")
@@ -229,12 +270,13 @@ def main() -> int:
 
     env_values = read_env_file(PROJECT_ROOT / ".env")
     database_url = env_values.get("APP_DATABASE_URL") or env_values.get("DATABASE_URL") or ""
+    database_endpoint = parse_database_endpoint(database_url)
     if not database_url:
         log(".env 中未发现 APP_DATABASE_URL / DATABASE_URL，应用可能回退到 SQLite", "WARN")
-    elif not database_url.startswith(("postgres://", "postgresql://", "postgresql+psycopg://")):
+    elif not database_endpoint:
         log(f".env 中数据库配置不是 PostgreSQL: {database_url}", "WARN")
     else:
-        log("检测到 PostgreSQL 数据库配置")
+        log(f"检测到 PostgreSQL 数据库配置: {database_endpoint[0]}:{database_endpoint[1]}")
 
     selected_port = resolve_available_port(args.host, args.port, max_scan=100)
     if selected_port != args.port:
@@ -243,8 +285,11 @@ def main() -> int:
     log(f"本次启动地址: {url}")
 
     if not args.skip_docker:
-        ensure_docker_daemon(args.db_timeout)
-        ensure_postgres_service(args.service, args.db_timeout, args.dry_run)
+        if database_endpoint and can_connect_tcp(database_endpoint[0], database_endpoint[1]):
+            log(f"检测到数据库已可直连，跳过 Docker/PostgreSQL 自动启动: {database_endpoint[0]}:{database_endpoint[1]}")
+        else:
+            ensure_docker_daemon(args.db_timeout)
+            ensure_postgres_service(args.service, args.db_timeout, args.dry_run, database_endpoint=database_endpoint)
     else:
         log("已按参数跳过 Docker/PostgreSQL 自动启动", "WARN")
 
@@ -263,3 +308,4 @@ if __name__ == "__main__":
     except LaunchError as exc:
         log(str(exc), "ERROR")
         raise SystemExit(1)
+
