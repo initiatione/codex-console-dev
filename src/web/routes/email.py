@@ -101,6 +101,39 @@ SENSITIVE_FIELDS = {
     'custom_auth',
 }
 
+
+def _coerce_config_bool(value: Any) -> Any:
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return value
+
+
+def _coerce_config_int(value: Any) -> Any:
+    if value in (None, ""):
+        return value
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return value
+
+
+def _coerce_config_float(value: Any) -> Any:
+    if value in (None, ""):
+        return value
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return value
+
+
 def normalize_email_service_config(service_type: str, config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """兼容历史配置字段，避免不同入口写入的键名不一致。"""
     normalized = dict(config or {})
@@ -111,6 +144,33 @@ def normalize_email_service_config(service_type: str, config: Optional[Dict[str,
 
     if service_type == "cloudmail" and normalized.get("api_key") and not normalized.get("admin_password"):
         normalized["admin_password"] = normalized.pop("api_key")
+
+    if service_type == "luckmail":
+        for key in ("project_code", "email_type", "preferred_domain", "sdk_preference", "inbox_mode", "rust_cli_path"):
+            if key in normalized and normalized.get(key) is not None:
+                normalized[key] = str(normalized.get(key) or "").strip()
+
+        for key in ("reuse_existing_purchases", "ensure_purchase_ready", "fallback_to_order_on_no_stock", "token_mail_fallback"):
+            if key in normalized:
+                normalized[key] = _coerce_config_bool(normalized.get(key))
+
+        for key in (
+            "purchase_scan_pages",
+            "purchase_scan_page_size",
+            "reuse_purchase_candidate_limit",
+            "token_alive_timeout",
+            "token_alive_request_timeout",
+            "purchase_ready_retries",
+            "timeout",
+            "max_retries",
+            "code_reuse_ttl",
+        ):
+            if key in normalized:
+                normalized[key] = _coerce_config_int(normalized.get(key))
+
+        for key in ("poll_interval", "token_alive_poll_interval"):
+            if key in normalized:
+                normalized[key] = _coerce_config_float(normalized.get(key))
 
     return normalized
 
@@ -375,14 +435,26 @@ async def get_service_types():
             {
                 "value": "luckmail",
                 "label": "LuckMail",
-                "description": "LuckMail 接码服务（下单 + 轮询验证码）",
+                "description": "LuckMail 已购邮箱/订单接码服务（支持 token alive 探活与邮件详情回退）",
                 "config_fields": [
-                    {"name": "base_url", "label": "平台地址", "required": False, "default": "https://mails.luckyous.com/"},
+                    {"name": "base_url", "label": "平台地址", "required": False, "default": "https://mails.luckyous.com/", "placeholder": "https://mails.luckyous.com/"},
                     {"name": "api_key", "label": "API Key", "required": True, "secret": True},
                     {"name": "project_code", "label": "项目编码", "required": False, "default": "openai"},
                     {"name": "email_type", "label": "邮箱类型", "required": False, "default": "ms_graph"},
                     {"name": "preferred_domain", "label": "优先域名", "required": False, "placeholder": "outlook.com"},
-                    {"name": "poll_interval", "label": "轮询间隔(秒)", "required": False, "default": 3.0},
+                    {"name": "rust_cli_path", "label": "Rust CLI 路径", "required": False, "placeholder": "%USERPROFILE%\\.cargo\\bin\\luckmail-cli.exe"},
+                    {"name": "sdk_preference", "label": "SDK 优先级", "required": False, "default": "auto", "placeholder": "auto / rust / python"},
+                    {"name": "inbox_mode", "label": "收件模式", "required": False, "default": "purchase", "placeholder": "purchase / order"},
+                    {"name": "reuse_existing_purchases", "label": "复用已购邮箱", "required": False, "default": True, "placeholder": "true / false"},
+                    {"name": "ensure_purchase_ready", "label": "先做邮箱可用性检查", "required": False, "default": True, "placeholder": "true / false"},
+                    {"name": "reuse_purchase_candidate_limit", "label": "复用探测候选上限", "required": False, "default": 3, "type": "number"},
+                    {"name": "token_alive_timeout", "label": "探活超时(秒)", "required": False, "default": 20, "type": "number"},
+                    {"name": "token_alive_request_timeout", "label": "单次探活请求超时(秒)", "required": False, "default": 4, "type": "number"},
+                    {"name": "token_alive_poll_interval", "label": "探活轮询间隔(秒)", "required": False, "default": 2.0, "type": "number"},
+                    {"name": "purchase_ready_retries", "label": "新购探活重试次数", "required": False, "default": 2, "type": "number"},
+                    {"name": "fallback_to_order_on_no_stock", "label": "无库存时回退订单模式", "required": False, "default": True, "placeholder": "true / false"},
+                    {"name": "token_mail_fallback", "label": "邮件列表/详情回退", "required": False, "default": True, "placeholder": "true / false"},
+                    {"name": "poll_interval", "label": "验证码轮询间隔(秒)", "required": False, "default": 3.0, "type": "number"},
                 ]
             }
         ]

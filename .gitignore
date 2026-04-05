@@ -61,3 +61,7 @@ pgdata/
 .codex_tmp/
 tests_runtime/
 pytest-cache-files-*/
+
+.omx/
+
+local_log.md

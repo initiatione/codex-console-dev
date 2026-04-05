@@ -9,6 +9,8 @@ from typing import Optional, Dict, Any, Union, Tuple
 from dataclasses import dataclass
 import logging
 
+import urllib.request
+from urllib.error import URLError
 from curl_cffi import requests as cffi_requests
 from curl_cffi.requests import Session, Response
 
@@ -266,6 +268,30 @@ class OpenAIHTTPClient(HTTPClient):
             "Sec-Fetch-Site": "same-site",
         }
 
+    def _parse_ip_location_trace(self, trace_text: str) -> Tuple[bool, Optional[str]]:
+        import re
+
+        loc_match = re.search(r"loc=([A-Z]+)", str(trace_text or ""))
+        loc = loc_match.group(1) if loc_match else None
+        if loc in ["CN", "HK", "MO", "TW"]:
+            return False, loc
+        return True, loc
+
+    def _check_ip_location_via_stdlib(self, timeout: int = 10) -> Tuple[bool, Optional[str]]:
+        opener = urllib.request.build_opener()
+        if self.proxy_url:
+            opener.add_handler(urllib.request.ProxyHandler({
+                "http": self.proxy_url,
+                "https": self.proxy_url,
+            }))
+        request = urllib.request.Request(
+            "https://cloudflare.com/cdn-cgi/trace",
+            headers={"User-Agent": self.default_headers.get("User-Agent", "Mozilla/5.0")},
+        )
+        with opener.open(request, timeout=timeout) as response:
+            trace_text = response.read().decode("utf-8", errors="replace")
+        return self._parse_ip_location_trace(trace_text)
+
     def check_ip_location(self) -> Tuple[bool, Optional[str]]:
         """
         检查 IP 地理位置
@@ -275,21 +301,14 @@ class OpenAIHTTPClient(HTTPClient):
         """
         try:
             response = self.get("https://cloudflare.com/cdn-cgi/trace", timeout=10)
-            trace_text = response.text
-
-            # 解析位置信息
-            import re
-            loc_match = re.search(r"loc=([A-Z]+)", trace_text)
-            loc = loc_match.group(1) if loc_match else None
-
-            # 检查是否支持
-            if loc in ["CN", "HK", "MO", "TW"]:
-                return False, loc
-            return True, loc
-
+            return self._parse_ip_location_trace(response.text)
         except Exception as e:
-            logger.error(f"检查 IP 地理位置失败: {e}")
-            return False, None
+            logger.warning(f"curl 路径检查 IP 地理位置失败，改走标准库兜底: {e}")
+            try:
+                return self._check_ip_location_via_stdlib(timeout=10)
+            except (OSError, URLError, ValueError) as fallback_exc:
+                logger.error(f"检查 IP 地理位置失败: {fallback_exc}")
+                return False, None
 
     def send_openai_request(
         self,

@@ -2,6 +2,20 @@
 
 ## v1.1.3
 
+- 补充 LuckMail 复用已购邮箱阶段的显式诊断日志：当当前条件下没有任何可复用候选时，日志会直接说明“未找到可复用已购邮箱候选，跳过邮箱可用性检查并直接尝试新购”，避免误以为系统没有执行可用性检查；并新增对应回归测试。
+
+- 修复本机 Codex 新会话的 Windows shell 环境缺项：全局 `C:\\Users\\liuchf\\.codex\\config.toml` 的 `shell_environment_policy.set` 已补入 `PATHEXT`，与已有的 `SystemRoot` / `windir` / `ComSpec` 一起确保新会话默认即可正常拉起 `python.exe`、`cmd.exe`、`git.exe` 等可执行程序。
+
+- 优化 LuckMail 当前实跑链路的探活速度：Rust CLI 的 `check_token_alive` 现支持单次请求级超时透传，服务层新增 `token_alive_request_timeout` 与 `reuse_purchase_candidate_limit`，复用已购邮箱默认只快速探测少量候选；同时补齐邮箱服务配置接口与回归测试，新增 `fallback_to_order_on_no_stock` 暴露，便于排查“无库存未回退 order”这类运行时配置问题。
+
+- 修复当前手动运行时的 LuckMail / 网络双环境问题：为实际运行的 `D:\\MiniConda\\python.exe` 安装 `luckmail-sdk` 并升级 `curl_cffi` 到 `0.15.0`，恢复 Rust 失败后的 Python fallback；同时为 IP 地理位置检查补充标准库网络兜底，并把 LuckMail 的 SDK 缺失提示与 `rust_cli_path` 占位文案改为系统安装路径语义。
+
+- 修复 LuckMail 收不到验证码的问题：LuckMail 服务现优先加载仓库内最新 SDK 资源，并在复用/新购已购邮箱后先做 token alive 可用性检查；若 get_token_code 未返回验证码，还会回退到邮件列表/详情接口提取验证码，减少失活邮箱与单接口漏码导致的超时失败。
+
+- 补充 LuckMail 配置兼容与异常兜底：邮箱服务配置接口现暴露 SDK 优先级、收件模式、探活与回退等关键参数；同时在 `get_token_code` 接口异常时，也会继续尝试邮件列表/详情接口，降低单接口抖动导致的漏码概率。
+
+- 预埋 LuckMail Rust CLI 双后端能力：新增本地 Rust CLI backend 封装、`sdk_preference`/`rust_cli_path` 配置与 Python fallback 选择逻辑；同时在 `LuckMailSdk-Rust` 中补入 `luckmail-cli` 二进制入口源码，待本机 Rust toolchain 恢复后即可编译接入。
+
 - 优化注册任务启动响应构造：单任务/普通批量启动现会在数据库会话仍存活时生成响应快照并回填已选 `email_service_id`，减少 detached ORM 对象往返与批量启动后的重复查询，响应字段更稳定。
 
 - 修复注册任务响应序列化回归：`task_to_response()` 现对 detached 的 SQLAlchemy `RegistrationTask` 实例做安全快照，避免在 Session 已关闭时访问 `email_service` 懒加载关系而触发 `DetachedInstanceError`；并补充对应回归测试。
@@ -50,3 +64,5 @@
 - 优化注册页最近任务展示：新增“最近注册任务”列表，并对启动时自动回收的历史僵尸任务打上“启动回收”标记，方便区分普通失败/取消与系统恢复记录。
 
 - 补充仓库忽略规则：新增忽略 `.codex_tmp/`、`tests_runtime/` 与 `pytest-cache-files-*`，避免提交本地临时脚本与测试缓存。
+
+- 补充仓库忽略规则：新增忽略 .omx/ 运行态目录，避免提交本地 HUD/通知/tmux 状态、指标与日志文件。

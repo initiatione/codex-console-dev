@@ -7,6 +7,7 @@ import json
 import re
 import sys
 import threading
+import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,6 +15,7 @@ from typing import Any, Dict, List, Optional, Set
 
 from .base import BaseEmailService, EmailServiceError, EmailServiceType
 from ..config.constants import OTP_CODE_PATTERN
+from .luckmail_rust_cli import LuckMailRustCliBackend, resolve_luckmail_rust_cli_path
 
 
 logger = logging.getLogger(__name__)
@@ -24,36 +26,102 @@ _INFLIGHT_EMAILS: Dict[str, Dict[str, Any]] = {}
 LUCKMAIL_APPEAL_ENABLED = False
 
 
+def _clear_luckmail_modules() -> None:
+    stale_names = [name for name in list(sys.modules.keys()) if name == "luckmail" or name.startswith("luckmail.")]
+    for name in stale_names:
+        sys.modules.pop(name, None)
+
+
+def _iter_luckmail_python_sdk_paths() -> List[Dict[str, str]]:
+    repo_root = Path(__file__).resolve().parents[2]
+    candidates: List[Dict[str, str]] = []
+
+    local_python_dir = repo_root / "LuckMailSdk-Python"
+    if local_python_dir.is_dir():
+        candidates.append({
+            "source": "python_sdk_dir",
+            "path": str(local_python_dir),
+        })
+
+    local_python_zip = repo_root / "LuckMailSdk-Python.zip"
+    if local_python_zip.is_file():
+        candidates.append({
+            "source": "python_sdk_zip",
+            "path": f"{local_python_zip}/LuckMailSdk-Python",
+        })
+
+    vendored_dir = repo_root / "luckmail"
+    if vendored_dir.is_dir():
+        candidates.append({
+            "source": "vendored_dir",
+            "path": str(vendored_dir),
+        })
+
+    tools_dir = Path(__file__).resolve().parents[3] / "tools" / "luckmail"
+    if tools_dir.is_dir():
+        candidates.append({
+            "source": "tools_dir",
+            "path": str(tools_dir),
+        })
+
+    return candidates
+
+
+def _has_luckmail_rust_sdk_assets() -> bool:
+    repo_root = Path(__file__).resolve().parents[2]
+    return any(
+        candidate.exists()
+        for candidate in (
+            repo_root / "LuckMailSdk-Rust",
+            repo_root / "LuckMailSdk-Rust.zip",
+        )
+    )
+
+
+def _coerce_bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return value != 0
+
+    text = str(value).strip().lower()
+    if not text:
+        return default
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
 def _load_luckmail_client_class():
     """
-    兼容两种来源：
-    1) 环境已安装 luckmail 包
-    2) 本地 vendored 目录（优先 codex-console/luckmail，其次 ../tools/luckmail）
+    兼容多种来源：
+    1) 根目录最新 Python SDK（目录 / zip）
+    2) 本地 vendored 目录
+    3) 环境已安装 luckmail 包
     """
-    try:
-        from luckmail import LuckMailClient  # type: ignore
-
-        return LuckMailClient
-    except Exception:
-        pass
-
-    candidates = [
-        Path(__file__).resolve().parents[2] / "luckmail",
-        Path(__file__).resolve().parents[3] / "tools" / "luckmail",
-    ]
-    for path in candidates:
-        if not path.is_dir():
-            continue
-        path_str = str(path)
+    for candidate in _iter_luckmail_python_sdk_paths():
+        path_str = candidate["path"]
         if path_str not in sys.path:
             sys.path.insert(0, path_str)
         try:
+            _clear_luckmail_modules()
             from luckmail import LuckMailClient  # type: ignore
 
-            return LuckMailClient
+            return LuckMailClient, f"python:{candidate['source']}"
         except Exception:
             continue
-    return None
+
+    try:
+        _clear_luckmail_modules()
+        from luckmail import LuckMailClient  # type: ignore
+
+        return LuckMailClient, "python:site_package"
+    except Exception:
+        return None, ""
 
 
 class LuckMailService(BaseEmailService):
@@ -68,6 +136,8 @@ class LuckMailService(BaseEmailService):
             "project_code": "openai",
             "email_type": "ms_graph",
             "preferred_domain": "",
+            # auto: 优先 Rust（若环境已有可执行适配器），否则回退 Python SDK。
+            "sdk_preference": "auto",
             # purchase: 购买邮箱 + token 拉码（可多次）
             # order: 创建接码订单 + 订单拉码（通常一次）
             "inbox_mode": "purchase",
@@ -75,6 +145,17 @@ class LuckMailService(BaseEmailService):
             "reuse_existing_purchases": True,
             "purchase_scan_pages": 5,
             "purchase_scan_page_size": 100,
+            "reuse_purchase_candidate_limit": 3,
+            # 已购邮箱在真正投入流程前先做 token alive 检查，避免复用失活邮箱。
+            "ensure_purchase_ready": True,
+            "token_alive_timeout": 20,
+            "token_alive_request_timeout": 4,
+            "token_alive_poll_interval": 2.0,
+            "purchase_ready_retries": 2,
+            # purchase 无库存时自动切到 order，避免整条链路直接失败。
+            "fallback_to_order_on_no_stock": True,
+            # 当 token code 接口没有返回验证码时，退回邮件列表/详情接口再读一次。
+            "token_mail_fallback": True,
             "timeout": 30,
             "max_retries": 3,
             "poll_interval": 3.0,
@@ -89,10 +170,25 @@ class LuckMailService(BaseEmailService):
         self.config["project_code"] = str(self.config.get("project_code") or "openai").strip()
         self.config["email_type"] = str(self.config.get("email_type") or "ms_graph").strip()
         self.config["preferred_domain"] = str(self.config.get("preferred_domain") or "").strip().lstrip("@")
+        self.config["sdk_preference"] = str(self.config.get("sdk_preference") or "auto").strip().lower()
+        self.config["rust_cli_path"] = str(self.config.get("rust_cli_path") or "").strip().strip('"')
+        if self.config["sdk_preference"] not in {"auto", "rust", "python"}:
+            self.config["sdk_preference"] = "auto"
         self.config["inbox_mode"] = self._normalize_inbox_mode(self.config.get("inbox_mode"))
-        self.config["reuse_existing_purchases"] = bool(self.config.get("reuse_existing_purchases", True))
+        self.config["reuse_existing_purchases"] = _coerce_bool(self.config.get("reuse_existing_purchases", True), True)
         self.config["purchase_scan_pages"] = max(int(self.config.get("purchase_scan_pages") or 5), 1)
         self.config["purchase_scan_page_size"] = max(int(self.config.get("purchase_scan_page_size") or 100), 1)
+        self.config["reuse_purchase_candidate_limit"] = max(int(self.config.get("reuse_purchase_candidate_limit") or 3), 1)
+        self.config["ensure_purchase_ready"] = _coerce_bool(self.config.get("ensure_purchase_ready", True), True)
+        self.config["token_alive_timeout"] = max(int(self.config.get("token_alive_timeout") or 20), 1)
+        self.config["token_alive_request_timeout"] = max(int(self.config.get("token_alive_request_timeout") or 4), 1)
+        self.config["token_alive_poll_interval"] = max(float(self.config.get("token_alive_poll_interval") or 2.0), 0.2)
+        self.config["purchase_ready_retries"] = max(int(self.config.get("purchase_ready_retries") or 2), 1)
+        self.config["fallback_to_order_on_no_stock"] = _coerce_bool(
+            self.config.get("fallback_to_order_on_no_stock", True),
+            True,
+        )
+        self.config["token_mail_fallback"] = _coerce_bool(self.config.get("token_mail_fallback", True), True)
         self.config["poll_interval"] = float(self.config.get("poll_interval") or 3.0)
         self.config["code_reuse_ttl"] = int(self.config.get("code_reuse_ttl") or 600)
 
@@ -101,19 +197,50 @@ class LuckMailService(BaseEmailService):
         if not self.config["project_code"]:
             raise ValueError("LuckMail 配置缺少 project_code")
 
-        client_cls = _load_luckmail_client_class()
-        if client_cls is None:
-            raise ValueError(
-                "未找到 LuckMail SDK，请先安装 luckmail 包或确保本地存在 tools/luckmail"
-            )
-
-        try:
-            self.client = client_cls(
+        self._rust_sdk_assets_present = _has_luckmail_rust_sdk_assets()
+        self._rust_cli_path = resolve_luckmail_rust_cli_path(self.config)
+        self._rust_backend: Optional[LuckMailRustCliBackend] = None
+        if self._rust_cli_path is not None:
+            self._rust_backend = LuckMailRustCliBackend(
+                binary_path=self._rust_cli_path,
                 base_url=self.config["base_url"],
                 api_key=self.config["api_key"],
+                timeout_seconds=int(self.config.get("timeout") or 30),
             )
-        except Exception as exc:
-            raise ValueError(f"初始化 LuckMail 客户端失败: {exc}")
+
+        self.client = None
+        self._python_sdk_backend = ""
+        client_cls, python_sdk_backend = _load_luckmail_client_class()
+        if client_cls is not None:
+            try:
+                self.client = client_cls(
+                    base_url=self.config["base_url"],
+                    api_key=self.config["api_key"],
+                )
+                self._python_sdk_backend = python_sdk_backend or "python:unknown"
+            except Exception as exc:
+                if self._rust_backend is None or self.config.get("sdk_preference") == "python":
+                    raise ValueError(f"初始化 LuckMail 客户端失败: {exc}")
+                logger.warning(f"LuckMail Python SDK 初始化失败，暂时仅使用 Rust CLI: {exc}")
+        elif self.config.get("sdk_preference") == "python":
+            raise ValueError("LuckMail 配置要求使用 Python SDK，但未找到可用 Python SDK")
+
+        if self._rust_backend is None and self.client is None:
+            raise ValueError(
+                "未找到 LuckMail SDK，请先在当前运行环境安装 luckmail-sdk，或确保系统已安装可执行的 luckmail-cli"
+            )
+
+        if self._rust_backend is not None and self.config.get("sdk_preference") in {"auto", "rust"}:
+            self._sdk_backend = "rust:cli"
+        else:
+            self._sdk_backend = self._python_sdk_backend or "python:unknown"
+
+        if (
+            self._rust_sdk_assets_present
+            and self.config.get("sdk_preference") in {"auto", "rust"}
+            and self._rust_backend is None
+        ):
+            logger.info("LuckMail 检测到 Rust SDK 源码，但当前环境尚未编译出 Rust CLI，暂时回退 Python SDK")
 
         self._orders_by_no: Dict[str, Dict[str, Any]] = {}
         self._orders_by_email: Dict[str, Dict[str, Any]] = {}
@@ -135,6 +262,22 @@ class LuckMailService(BaseEmailService):
         }
         return aliases.get(mode, "purchase")
 
+    def _is_no_stock_error(self, error: Any) -> bool:
+        text = str(error or "").strip().lower()
+        if not text:
+            return False
+        return any(
+            marker in text
+            for marker in (
+                "无库存",
+                "库存不足",
+                "no stock",
+                "code: 2003",
+                'code": 2003',
+                "api { code: 2003",
+            )
+        )
+
     def _extract_field(self, obj: Any, *keys: str) -> Any:
         if obj is None:
             return None
@@ -147,6 +290,377 @@ class LuckMailService(BaseEmailService):
             if hasattr(obj, k):
                 return getattr(obj, k)
         return None
+
+    def _extract_list(self, obj: Any, *keys: str) -> List[Any]:
+        if obj is None:
+            return []
+        if isinstance(obj, list):
+            return list(obj)
+        if isinstance(obj, dict):
+            for k in keys:
+                value = obj.get(k)
+                if isinstance(value, list):
+                    return list(value)
+            nested = obj.get("data")
+            if isinstance(nested, dict):
+                return self._extract_list(nested, *keys)
+            return []
+        for k in keys:
+            value = getattr(obj, k, None)
+            if isinstance(value, list):
+                return list(value)
+        return []
+
+    def _prefers_rust_backend(self) -> bool:
+        return self._rust_backend is not None and self.config.get("sdk_preference") in {"auto", "rust"}
+
+    def _call_preferred_backend(self, action: str, rust_call=None, python_call=None):
+        last_error: Optional[Exception] = None
+        if self._prefers_rust_backend() and callable(rust_call):
+            try:
+                return rust_call()
+            except Exception as exc:
+                last_error = exc
+                if callable(python_call):
+                    logger.warning(f"LuckMail Rust backend {action} 失败，回退 Python SDK: {exc}")
+                else:
+                    logger.warning(f"LuckMail Rust backend {action} 失败，且当前运行环境未提供 Python SDK 回退: {exc}")
+                if not callable(python_call):
+                    raise
+
+        if callable(python_call):
+            return python_call()
+
+        if last_error is not None:
+            raise last_error
+        raise EmailServiceError(f"LuckMail 后端不可用: {action}")
+
+    def _backend_get_purchases(self, page: int, page_size: int, user_disabled: int = 0):
+        rust_call = None
+        if self._rust_backend is not None:
+            rust_call = lambda: self._rust_backend.get_purchases(page=page, page_size=page_size, user_disabled=user_disabled)
+        python_call = None
+        if self.client is not None:
+            python_call = lambda: self.client.user.get_purchases(page=page, page_size=page_size, user_disabled=user_disabled)
+        return self._call_preferred_backend("get_purchases", rust_call=rust_call, python_call=python_call)
+
+    def _backend_create_order(
+        self,
+        project_code: str,
+        email_type: str,
+        preferred_domain: str,
+        specified_email: Optional[str] = None,
+        variant_mode: Optional[str] = None,
+    ):
+        rust_call = None
+        if self._rust_backend is not None:
+            rust_call = lambda: self._rust_backend.create_order(
+                project_code=project_code,
+                email_type=email_type,
+                domain=preferred_domain or None,
+                specified_email=specified_email,
+                variant_mode=variant_mode,
+            )
+        python_call = None
+        if self.client is not None:
+            kwargs: Dict[str, Any] = {
+                "project_code": project_code,
+                "email_type": email_type,
+            }
+            if preferred_domain:
+                kwargs["domain"] = preferred_domain
+            if specified_email:
+                kwargs["specified_email"] = specified_email
+            if variant_mode:
+                kwargs["variant_mode"] = variant_mode
+            python_call = lambda: self.client.user.create_order(**kwargs)
+        return self._call_preferred_backend("create_order", rust_call=rust_call, python_call=python_call)
+
+    def _backend_purchase_emails(self, project_code: str, quantity: int, email_type: str, preferred_domain: str):
+        rust_call = None
+        if self._rust_backend is not None:
+            rust_call = lambda: self._rust_backend.purchase_emails(
+                project_code=project_code,
+                quantity=quantity,
+                email_type=email_type,
+                domain=preferred_domain or None,
+            )
+        python_call = None
+        if self.client is not None:
+            kwargs: Dict[str, Any] = {
+                "project_code": project_code,
+                "quantity": quantity,
+                "email_type": email_type,
+            }
+            if preferred_domain:
+                kwargs["domain"] = preferred_domain
+            python_call = lambda: self.client.user.purchase_emails(**kwargs)
+        return self._call_preferred_backend("purchase_emails", rust_call=rust_call, python_call=python_call)
+
+    def _backend_check_token_alive(self, token: str, request_timeout_seconds: Optional[int] = None):
+        rust_call = None
+        if self._rust_backend is not None:
+            rust_call = lambda: self._rust_backend.check_token_alive(token, timeout_seconds=request_timeout_seconds)
+        python_alive_method = getattr(getattr(self.client, "user", None), "check_token_alive", None)
+        python_call = (lambda: python_alive_method(token)) if callable(python_alive_method) else None
+        return self._call_preferred_backend("check_token_alive", rust_call=rust_call, python_call=python_call)
+
+    def _backend_get_token_code(self, token: str):
+        rust_call = (lambda: self._rust_backend.get_token_code(token)) if self._rust_backend is not None else None
+        python_call = (lambda: self.client.user.get_token_code(token)) if self.client is not None else None
+        return self._call_preferred_backend("get_token_code", rust_call=rust_call, python_call=python_call)
+
+    def _backend_get_order_code(self, order_no: str):
+        rust_call = (lambda: self._rust_backend.get_order_code(order_no)) if self._rust_backend is not None else None
+        python_call = (lambda: self.client.user.get_order_code(order_no)) if self.client is not None else None
+        return self._call_preferred_backend("get_order_code", rust_call=rust_call, python_call=python_call)
+
+    def _backend_get_token_mails(self, token: str):
+        rust_call = (lambda: self._rust_backend.get_token_mails(token)) if self._rust_backend is not None else None
+        python_call = (lambda: self.client.user.get_token_mails(token)) if self.client is not None else None
+        return self._call_preferred_backend("get_token_mails", rust_call=rust_call, python_call=python_call)
+
+    def _backend_get_token_mail_detail(self, token: str, message_id: str):
+        rust_call = (lambda: self._rust_backend.get_token_mail_detail(token, message_id)) if self._rust_backend is not None else None
+        python_call = (lambda: self.client.user.get_token_mail_detail(token, message_id)) if self.client is not None else None
+        return self._call_preferred_backend("get_token_mail_detail", rust_call=rust_call, python_call=python_call)
+
+    def _backend_set_purchase_disabled(self, purchase_id: int, disabled: int):
+        rust_call = (lambda: self._rust_backend.set_purchase_disabled(purchase_id, disabled)) if self._rust_backend is not None else None
+        python_call = (lambda: self.client.user.set_purchase_disabled(purchase_id, disabled)) if self.client is not None else None
+        return self._call_preferred_backend("set_purchase_disabled", rust_call=rust_call, python_call=python_call)
+
+    def _backend_cancel_order(self, order_no: str):
+        rust_call = (lambda: self._rust_backend.cancel_order(order_no)) if self._rust_backend is not None else None
+        python_call = (lambda: self.client.user.cancel_order(order_no)) if self.client is not None else None
+        return self._call_preferred_backend("cancel_order", rust_call=rust_call, python_call=python_call)
+
+    def _backend_get_balance(self):
+        rust_call = (lambda: self._rust_backend.get_balance()) if self._rust_backend is not None else None
+        python_call = (lambda: self.client.user.get_balance()) if self.client is not None else None
+        return self._call_preferred_backend("get_balance", rust_call=rust_call, python_call=python_call)
+
+    def _extract_code_from_text(self, text: Any, pattern: str = OTP_CODE_PATTERN) -> str:
+        text_value = str(text or "").strip()
+        if not text_value:
+            return ""
+        try:
+            match = re.search(pattern or OTP_CODE_PATTERN, text_value)
+        except re.error:
+            return ""
+        if not match:
+            return ""
+        groups = match.groups()
+        if groups:
+            for group in groups:
+                group_text = str(group or "").strip()
+                if group_text:
+                    return group_text
+        return str(match.group(0) or "").strip()
+
+    def _parse_mail_timestamp(self, value: Any) -> Optional[float]:
+        if value in (None, ""):
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        text = str(value).strip()
+        if not text:
+            return None
+        normalized = text.replace("Z", "+00:00")
+        for candidate in (normalized, normalized.replace(" ", "T")):
+            try:
+                parsed = datetime.fromisoformat(candidate)
+            except Exception:
+                continue
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.timestamp()
+        return None
+
+    def _is_terminal_alive_status(self, status: str, message: str) -> bool:
+        status_text = str(status or "").strip().lower()
+        message_text = str(message or "").strip().lower()
+        if status_text in {"failed", "invalid", "disabled", "expired", "deleted", "not_found"}:
+            return True
+        return any(
+            marker in message_text
+            for marker in (
+                "invalid",
+                "disabled",
+                "expired",
+                "not found",
+                "不存在",
+                "不可用",
+                "失效",
+                "禁用",
+            )
+        )
+
+    def _record_unavailable_purchase(self, order_info: Dict[str, Any], reason: str) -> None:
+        email = self._normalize_email(order_info.get("email"))
+        if not email:
+            return
+        extra = {
+            "service_id": order_info.get("service_id"),
+            "token": order_info.get("token"),
+            "purchase_id": order_info.get("purchase_id"),
+            "source": order_info.get("source"),
+            "project_code": order_info.get("project_code"),
+            "email_type": order_info.get("email_type"),
+        }
+        self._mark_failed_email(email, reason=reason, extra=extra)
+
+    def _ensure_purchase_inbox_ready(self, order_info: Dict[str, Any]) -> bool:
+        if not bool(self.config.get("ensure_purchase_ready", True)):
+            return True
+        if self._normalize_inbox_mode(order_info.get("inbox_mode")) != "purchase":
+            return True
+
+        token = str(order_info.get("token") or "").strip()
+        email = self._normalize_email(order_info.get("email"))
+        if not token:
+            return False
+
+        python_alive_method = getattr(getattr(self.client, "user", None), "check_token_alive", None)
+        if self._rust_backend is None and not callable(python_alive_method):
+            logger.warning("LuckMail 当前 SDK 不支持 token alive 检查，跳过已购邮箱前置探活")
+            return True
+
+        source = str(order_info.get("source") or "").strip().lower()
+        max_attempts = 1 if source in {"reuse_purchase", "resume_failed"} else 2
+        deadline = time.time() + max(int(self.config.get("token_alive_timeout") or 20), 1)
+        request_timeout = max(int(self.config.get("token_alive_request_timeout") or 4), 1)
+        poll_interval = max(float(self.config.get("token_alive_poll_interval") or 2.0), 0.2)
+        last_status = ""
+        last_message = ""
+        last_mail_count: Any = None
+        last_error: Optional[Exception] = None
+
+        for attempt in range(1, max_attempts + 1):
+            remaining_seconds = max(int(deadline - time.time()), 1)
+            effective_timeout = max(min(request_timeout, remaining_seconds), 1)
+            try:
+                result = self._backend_check_token_alive(token, request_timeout_seconds=effective_timeout)
+                alive = bool(self._extract_field(result, "alive"))
+                status = str(self._extract_field(result, "status") or "").strip().lower()
+                message = str(self._extract_field(result, "message") or "").strip()
+                mail_count = self._extract_field(result, "mail_count")
+                last_status = status
+                last_message = message
+                last_mail_count = mail_count
+                if alive or status in {"ok", "alive", "success", "ready"}:
+                    order_info["alive_checked_at"] = self._now_iso()
+                    if mail_count not in (None, ""):
+                        order_info["mail_count"] = mail_count
+                    return True
+                if self._is_terminal_alive_status(status, message):
+                    break
+            except Exception as exc:
+                last_error = exc
+
+            if attempt >= max_attempts or time.time() >= deadline:
+                break
+            time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
+
+        if last_error is not None:
+            logger.warning(f"LuckMail 邮箱可用性检查失败: email={email}, error={last_error}")
+            self.update_status(False, last_error)
+        else:
+            logger.warning(
+                "LuckMail 邮箱可用性检查未通过: "
+                f"email={email}, status={last_status or '-'}, message={last_message or '-'}, "
+                f"mail_count={last_mail_count if last_mail_count not in (None, '') else '-'}"
+            )
+        return False
+
+    def _create_ready_purchase_inbox(
+        self,
+        project_code: str,
+        email_type: str,
+        preferred_domain: str,
+    ) -> Dict[str, Any]:
+        max_attempts = max(int(self.config.get("purchase_ready_retries") or 2), 1)
+        last_error: Optional[EmailServiceError] = None
+
+        for attempt in range(1, max_attempts + 1):
+            order_info = self._create_purchase_inbox(
+                project_code=project_code,
+                email_type=email_type,
+                preferred_domain=preferred_domain,
+            )
+            email = self._normalize_email(order_info.get("email"))
+            if not self._claim_email(email, order_info):
+                logger.warning(f"LuckMail 邮箱已被并发任务占用，放弃本次分配: {email}")
+                raise EmailServiceError(f"LuckMail 邮箱已被并发任务占用: {email}")
+
+            if self._ensure_purchase_inbox_ready(order_info):
+                return order_info
+
+            reason = f"LuckMail 邮箱可用性检查失败: {email}"
+            self._record_unavailable_purchase(order_info, reason)
+            self._release_claimed_email(email)
+            last_error = EmailServiceError(reason)
+            if attempt < max_attempts:
+                logger.warning(f"LuckMail 新购邮箱探活未通过，准备重试购买: {email} ({attempt}/{max_attempts})")
+
+        if last_error is not None:
+            raise last_error
+        raise EmailServiceError("LuckMail 购买邮箱失败：未获取到可用邮箱")
+
+    def _fetch_token_code_from_mail_fallback(
+        self,
+        token: str,
+        pattern: str,
+        otp_sent_at: Optional[float] = None,
+    ) -> str:
+        if not bool(self.config.get("token_mail_fallback", True)):
+            return ""
+
+        list_method = None
+        detail_method = None
+        if self.client is not None:
+            user_client = getattr(self.client, "user", None)
+            list_method = getattr(user_client, "get_token_mails", None)
+            detail_method = getattr(user_client, "get_token_mail_detail", None)
+        if self._rust_backend is None and not callable(list_method):
+            return ""
+        try:
+            mails_result = self._backend_get_token_mails(token)
+            mails = self._extract_list(mails_result, "mails", "list", "items")
+        except Exception as exc:
+            logger.warning(f"LuckMail 拉取邮件列表失败: {exc}")
+            return ""
+
+        for item in mails:
+            received_at = self._parse_mail_timestamp(
+                self._extract_field(item, "received_at", "created_at", "createdAt")
+            )
+            if otp_sent_at and received_at is not None and received_at + 1 < float(otp_sent_at):
+                continue
+
+            detail_payload = item
+            message_id = str(self._extract_field(item, "message_id", "id") or "").strip()
+            if callable(detail_method) and message_id:
+                try:
+                    detail_payload = self._backend_get_token_mail_detail(token, message_id)
+                except Exception as exc:
+                    logger.warning(f"LuckMail 拉取邮件详情失败: token={token}, message_id={message_id}, error={exc}")
+                    detail_payload = item
+
+            direct_code = str(self._extract_field(detail_payload, "verification_code") or "").strip()
+            if direct_code:
+                return direct_code
+
+            for text_field in (
+                self._extract_field(detail_payload, "body_text", "text", "body"),
+                self._extract_field(detail_payload, "body_html", "html_body", "html"),
+                self._extract_field(detail_payload, "subject", "mail_subject"),
+            ):
+                code = self._extract_code_from_text(text_field, pattern)
+                if code:
+                    return code
+
+        return ""
 
     def _cache_order(self, info: Dict[str, Any]) -> None:
         order_key = str(info.get("order_no") or info.get("service_id") or "").strip()
@@ -646,7 +1160,7 @@ class LuckMailService(BaseEmailService):
     def _iter_purchase_items(self, scan_pages: int, page_size: int):
         for page in range(1, scan_pages + 1):
             try:
-                page_result = self.client.user.get_purchases(
+                page_result = self._backend_get_purchases(
                     page=page,
                     page_size=page_size,
                     user_disabled=0,
@@ -655,7 +1169,7 @@ class LuckMailService(BaseEmailService):
                 logger.warning(f"LuckMail 拉取已购邮箱失败: page={page}, error={exc}")
                 break
 
-            items = list(getattr(page_result, "list", []) or [])
+            items = self._extract_list(page_result, "list", "items", "purchases")
             if not items:
                 break
 
@@ -753,9 +1267,15 @@ class LuckMailService(BaseEmailService):
             candidates.append(info)
 
         if not candidates:
+            logger.info(
+                "LuckMail 未找到可复用已购邮箱候选，跳过邮箱可用性检查并直接尝试新购: "
+                f"project_code={project_code}, email_type={email_type}, domain={preferred_domain or '-'}"
+            )
             return None
 
         existing_in_db = self._query_existing_account_emails({self._normalize_email(c.get("email")) for c in candidates})
+        probe_limit = int(self.config.get("reuse_purchase_candidate_limit") or 3)
+        probed_candidates = 0
         for info in candidates:
             email = self._normalize_email(info.get("email"))
             if email in existing_in_db:
@@ -768,8 +1288,20 @@ class LuckMailService(BaseEmailService):
                     },
                 )
                 continue
+            if probed_candidates >= probe_limit:
+                logger.info(
+                    f"LuckMail 复用邮箱候选已达到探测上限，优先检查前 {probed_candidates} 个可用候选"
+                )
+                break
             if not self._claim_email(email, info):
                 logger.info(f"LuckMail 复用邮箱已被当前批次占用，跳过: {email}")
+                continue
+            probed_candidates += 1
+            if not self._ensure_purchase_inbox_ready(info):
+                reason = f"LuckMail 邮箱可用性检查失败: {email}"
+                self._record_unavailable_purchase(info, reason)
+                self._release_claimed_email(email)
+                logger.warning(f"LuckMail 复用邮箱探活未通过，已跳过: {email}")
                 continue
             return info
         return None
@@ -782,15 +1314,12 @@ class LuckMailService(BaseEmailService):
         specified_email: Optional[str] = None,
     ) -> Dict[str, Any]:
         try:
-            kwargs: Dict[str, Any] = {
-                "project_code": project_code,
-                "email_type": email_type,
-            }
-            if preferred_domain:
-                kwargs["domain"] = preferred_domain
-            if specified_email:
-                kwargs["specified_email"] = specified_email
-            order = self.client.user.create_order(**kwargs)
+            order = self._backend_create_order(
+                project_code=project_code,
+                email_type=email_type,
+                preferred_domain=preferred_domain,
+                specified_email=specified_email,
+            )
         except Exception as exc:
             self.update_status(False, exc)
             raise EmailServiceError(f"LuckMail 创建订单失败: {exc}")
@@ -850,14 +1379,12 @@ class LuckMailService(BaseEmailService):
         preferred_domain: str,
     ) -> Dict[str, Any]:
         try:
-            kwargs: Dict[str, Any] = {
-                "project_code": project_code,
-                "quantity": 1,
-                "email_type": email_type,
-            }
-            if preferred_domain:
-                kwargs["domain"] = preferred_domain
-            purchased = self.client.user.purchase_emails(**kwargs)
+            purchased = self._backend_purchase_emails(
+                project_code=project_code,
+                quantity=1,
+                email_type=email_type,
+                preferred_domain=preferred_domain,
+            )
         except Exception as exc:
             self.update_status(False, exc)
             raise EmailServiceError(f"LuckMail 购买邮箱失败: {exc}")
@@ -913,27 +1440,49 @@ class LuckMailService(BaseEmailService):
                 preferred_domain=preferred_domain,
             )
         else:
-            if bool(self.config.get("reuse_existing_purchases", True)):
-                reused = self._pick_reusable_purchase_inbox(
-                    project_code=project_code,
-                    email_type=email_type,
-                    preferred_domain=preferred_domain,
-                )
-                if reused:
-                    order_info = reused
-                    claimed_in_picker = True
-                else:
-                    order_info = self._create_purchase_inbox(
+            try:
+                if bool(self.config.get("reuse_existing_purchases", True)):
+                    reused = self._pick_reusable_purchase_inbox(
                         project_code=project_code,
                         email_type=email_type,
                         preferred_domain=preferred_domain,
                     )
-            else:
-                order_info = self._create_purchase_inbox(
+                    if reused:
+                        order_info = reused
+                        claimed_in_picker = True
+                    else:
+                        order_info = self._create_ready_purchase_inbox(
+                            project_code=project_code,
+                            email_type=email_type,
+                            preferred_domain=preferred_domain,
+                        )
+                        claimed_in_picker = True
+                else:
+                    order_info = self._create_ready_purchase_inbox(
+                        project_code=project_code,
+                        email_type=email_type,
+                        preferred_domain=preferred_domain,
+                    )
+                    claimed_in_picker = True
+            except EmailServiceError as exc:
+                if not (
+                    bool(self.config.get("fallback_to_order_on_no_stock", True))
+                    and self._is_no_stock_error(exc)
+                ):
+                    raise
+                logger.warning(
+                    "LuckMail purchase 模式无库存，自动回退 order 模式: "
+                    f"project_code={project_code}, email_type={email_type}, domain={preferred_domain or '-'}"
+                )
+                order_info = self._create_order_inbox(
                     project_code=project_code,
                     email_type=email_type,
                     preferred_domain=preferred_domain,
                 )
+                order_info["source"] = "purchase_no_stock_fallback_order"
+            else:
+                if not claimed_in_picker and order_info.get("inbox_mode") == "purchase":
+                    claimed_in_picker = True
 
         if not claimed_in_picker:
             email = self._normalize_email(order_info.get("email"))
@@ -988,20 +1537,41 @@ class LuckMailService(BaseEmailService):
         otp_guard_until = (float(otp_sent_at) + 1.5) if otp_sent_at else None
 
         while time.time() < deadline:
+            result = None
+            code = ""
             try:
                 if inbox_mode == "purchase":
-                    result = self.client.user.get_token_code(token)
+                    result = self._backend_get_token_code(token)
                     status = "success" if bool(self._extract_field(result, "has_new_mail")) else "pending"
                 else:
-                    result = self.client.user.get_order_code(order_no)
+                    result = self._backend_get_order_code(order_no)
                     status = str(self._extract_field(result, "status") or "").strip().lower()
             except Exception as exc:
                 logger.warning(f"LuckMail 拉取验证码失败: {exc}")
                 self.update_status(False, exc)
-                time.sleep(min(poll_interval, 1.0))
-                continue
+                if inbox_mode == "purchase":
+                    code = self._fetch_token_code_from_mail_fallback(
+                        token=token,
+                        pattern=pattern,
+                        otp_sent_at=otp_sent_at,
+                    )
+                    if code:
+                        status = "success"
+                    else:
+                        time.sleep(min(poll_interval, 1.0))
+                        continue
+                else:
+                    time.sleep(min(poll_interval, 1.0))
+                    continue
 
-            code = str(self._extract_field(result, "verification_code") or "").strip()
+            if result is not None:
+                code = str(self._extract_field(result, "verification_code") or "").strip()
+            if inbox_mode == "purchase" and not code:
+                code = self._fetch_token_code_from_mail_fallback(
+                    token=token,
+                    pattern=pattern,
+                    otp_sent_at=otp_sent_at,
+                )
 
             # token 模式下，部分平台会在 has_new_mail=false 时也返回最近一次 code。
             # 这里以 code 为准，再配合“最近已用验证码”过滤旧码。
@@ -1060,11 +1630,11 @@ class LuckMailService(BaseEmailService):
             if token and purchase_id.isdigit():
                 # 购买邮箱通常不支持直接删除，标记禁用即可。
                 try:
-                    self.client.user.set_purchase_disabled(int(purchase_id), 1)
+                    self._backend_set_purchase_disabled(int(purchase_id), 1)
                 except Exception:
                     pass
             elif order_no:
-                self.client.user.cancel_order(order_no)
+                self._backend_cancel_order(order_no)
 
             key = token or order_no
             item = self._orders_by_no.pop(key, None)
@@ -1086,7 +1656,7 @@ class LuckMailService(BaseEmailService):
 
     def check_health(self) -> bool:
         try:
-            self.client.user.get_balance()
+            self._backend_get_balance()
             self.update_status(True)
             return True
         except Exception as exc:
@@ -1102,6 +1672,9 @@ class LuckMailService(BaseEmailService):
             "project_code": self.config.get("project_code"),
             "email_type": self.config.get("email_type"),
             "preferred_domain": self.config.get("preferred_domain"),
+            "sdk_preference": self.config.get("sdk_preference"),
+            "sdk_backend": self._sdk_backend,
+            "rust_cli_path": str(self._rust_cli_path or ""),
             "inbox_mode": self.config.get("inbox_mode"),
             "cached_orders": len(self._orders_by_no),
             "status": self.status.value,

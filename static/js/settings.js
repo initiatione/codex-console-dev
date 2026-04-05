@@ -768,11 +768,11 @@ async function loadServiceConfigFields(serviceType) {
         elements.serviceConfigFields.innerHTML = typeInfo.config_fields.map(field => `
             <div class="form-group">
                 <label for="config-${field.name}">${field.label}</label>
-                <input type="${field.name.includes('password') || field.name.includes('token') ? 'password' : 'text'}"
+                <input type="${field.type || ((field.secret || field.name.includes('password') || field.name.includes('token')) ? 'password' : 'text')}"
                        id="config-${field.name}"
                        name="${field.name}"
-                       value="${field.default || ''}"
-                       placeholder="${field.label}"
+                       value="${field.default ?? ''}"
+                       placeholder="${field.placeholder || field.label}"
                        ${field.required ? 'required' : ''}>
             </div>
         `).join('');
