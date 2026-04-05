@@ -139,6 +139,8 @@ def build_service(monkeypatch, user, config=None, python_client_cls=FakeClient, 
     else:
         monkeypatch.setattr(luckmail_module, "_load_luckmail_client_class", lambda: (python_client_cls, "python:test"))
     monkeypatch.setattr(luckmail_module, "_has_luckmail_rust_sdk_assets", lambda: True)
+    monkeypatch.setattr(luckmail_module, "_BATCH_REUSE_POOLS", {})
+    monkeypatch.setattr(luckmail_module, "_BATCH_REUSE_PREPARED", set())
     monkeypatch.setattr(
         luckmail_module,
         "resolve_luckmail_rust_cli_path",
@@ -536,3 +538,134 @@ def test_pick_reusable_purchase_inbox_logs_when_no_candidates(monkeypatch, caplo
     alive_calls = [call for call in user.calls if call[0] == "check_token_alive"]
     assert alive_calls == []
 
+
+
+def test_prepare_batch_reusable_inboxes_prefills_pool_and_create_email_consumes_it(monkeypatch):
+    user = FakeUser()
+    user.purchase_pages = [[
+        {"id": 101, "email_address": "first@example.com", "token": "tok-first"},
+        {"id": 102, "email_address": "second@example.com", "token": "tok-second"},
+    ]]
+    user.alive_results = {
+        "tok-first": [{"alive": True, "status": "ok", "message": "ready", "mail_count": 0}],
+        "tok-second": [{"alive": True, "status": "ok", "message": "ready", "mail_count": 1}],
+    }
+
+    service = build_service(monkeypatch, user)
+
+    prepared_count = service.prepare_batch_reusable_inboxes("batch-prefill", 2)
+    first = service.create_email({"batch_id": "batch-prefill"})
+    second = service.create_email({"batch_id": "batch-prefill"})
+
+    assert prepared_count == 2
+    assert first["email"] == "first@example.com"
+    assert second["email"] == "second@example.com"
+    get_purchase_calls = [call for call in user.calls if call[0] == "get_purchases"]
+    assert get_purchase_calls == [("get_purchases", 1, 100, 0)]
+    alive_calls = [call for call in user.calls if call[0] == "check_token_alive"]
+    assert [call[1] for call in alive_calls] == ["tok-first", "tok-second"]
+
+
+def test_create_email_skips_rescan_when_batch_reuse_pool_is_prepared_but_empty(monkeypatch):
+    user = FakeUser()
+    user.purchase_results = [
+        {"purchases": [{"id": 301, "email_address": "new@example.com", "token": "tok-new"}]}
+    ]
+    user.alive_results = {
+        "tok-new": [{"alive": True, "status": "ok", "message": "ready", "mail_count": 0}],
+    }
+
+    service = build_service(monkeypatch, user)
+    service.prepare_batch_reusable_inboxes("batch-empty", 1)
+
+    def fail_if_rescan(*args, **kwargs):
+        raise AssertionError("batch prepared flow should not rescan reusable purchases")
+
+    monkeypatch.setattr(service, "_pick_reusable_purchase_inbox", fail_if_rescan)
+
+    result = service.create_email({"batch_id": "batch-empty"})
+
+    assert result["email"] == "new@example.com"
+    purchase_calls = [call for call in user.calls if call[0] == "purchase_emails"]
+    assert len(purchase_calls) == 1
+
+
+def test_run_batch_purchase_action_waits_for_next_slot(monkeypatch):
+    user = FakeUser()
+    service = build_service(monkeypatch, user)
+
+    luckmail_module.LuckMailService.clear_batch_reuse_pool("batch-gate")
+    luckmail_module._BATCH_PURCHASE_NEXT_ALLOWED_AT["batch-gate"] = 101.25
+    sleep_calls = []
+    now = {"value": 100.0}
+
+    def fake_time():
+        return now["value"]
+
+    def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+        now["value"] += seconds
+
+    monkeypatch.setattr(luckmail_module.time, "time", fake_time)
+    monkeypatch.setattr(luckmail_module.time, "sleep", fake_sleep)
+
+    result = service._run_batch_purchase_action("batch-gate", "purchase_emails", lambda: "ok")
+
+    assert result == "ok"
+    assert sleep_calls == [1.25]
+    assert luckmail_module._BATCH_PURCHASE_NEXT_ALLOWED_AT["batch-gate"] == 102.25
+    luckmail_module.LuckMailService.clear_batch_reuse_pool("batch-gate")
+
+
+def test_create_email_routes_batch_new_purchase_through_gate(monkeypatch):
+    user = FakeUser()
+    user.purchase_results = [
+        {"purchases": [{"id": 401, "email_address": "gate@example.com", "token": "tok-gate"}]}
+    ]
+    user.alive_results = {
+        "tok-gate": [{"alive": True, "status": "ok", "message": "ready", "mail_count": 0}],
+    }
+
+    service = build_service(
+        monkeypatch,
+        user,
+        config={"reuse_existing_purchases": False},
+    )
+    gate_calls = []
+
+    def fake_batch_gate(batch_id, action, func):
+        gate_calls.append((batch_id, action))
+        return func()
+
+    monkeypatch.setattr(service, "_run_batch_purchase_action", fake_batch_gate)
+
+    result = service.create_email({"batch_id": "batch-purchase"})
+
+    assert result["email"] == "gate@example.com"
+    assert gate_calls == [("batch-purchase", "purchase_emails")]
+
+
+def test_create_order_uses_batch_gate_when_batch_id_present(monkeypatch):
+    user = FakeUser()
+    user.create_order_results = [
+        {"order_no": "ord-batch-1", "email_address": "order-batch@example.com"}
+    ]
+
+    service = build_service(monkeypatch, user)
+    gate_calls = []
+
+    def fake_batch_gate(batch_id, action, func):
+        gate_calls.append((batch_id, action))
+        return func()
+
+    monkeypatch.setattr(service, "_run_batch_purchase_action", fake_batch_gate)
+
+    result = service._create_order_inbox(
+        project_code="openai",
+        email_type="ms_graph",
+        preferred_domain="hotmail.com",
+        batch_id="batch-order",
+    )
+
+    assert result["order_no"] == "ord-batch-1"
+    assert gate_calls == [("batch-order", "create_order")]

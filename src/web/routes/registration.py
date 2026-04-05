@@ -853,6 +853,11 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                 else:
                     config = email_service_config or {}
 
+            if service_type == EmailServiceType.LUCKMAIL:
+                config = dict(config or {})
+                if batch_id:
+                    config["batch_id"] = batch_id
+
             email_service = EmailServiceFactory.create(service_type, config)
             log_callback = task_manager.create_log_callback(task_uuid, prefix=log_prefix, batch_id=batch_id)
 
@@ -1249,6 +1254,114 @@ def _make_batch_helpers(batch_id: str):
     return add_batch_log, update_batch_status
 
 
+
+
+def _prepare_luckmail_batch_reuse_pool_sync(
+    batch_id: str,
+    task_count: int,
+    email_service_type: str,
+    proxy: Optional[str],
+    email_service_config: Optional[dict],
+    email_service_id: Optional[int],
+) -> Dict[str, Any]:
+    service_type = EmailServiceType(email_service_type)
+    if service_type != EmailServiceType.LUCKMAIL and not email_service_id:
+        return {"applicable": False}
+
+    from ...database.models import EmailService as EmailServiceModel
+    from ...services.luckmail_mail import LuckMailService
+
+    config: Dict[str, Any]
+    service_name = "luckmail"
+    with get_db() as db:
+        if email_service_id:
+            db_service = db.query(EmailServiceModel).filter(
+                EmailServiceModel.id == email_service_id,
+                EmailServiceModel.enabled == True,
+            ).first()
+            if not db_service:
+                return {"applicable": False}
+            if str(db_service.service_type or "") != EmailServiceType.LUCKMAIL.value:
+                return {"applicable": False}
+            config = _normalize_email_service_config(EmailServiceType.LUCKMAIL, db_service.config, proxy)
+            service_name = str(db_service.name or "luckmail").strip() or "luckmail"
+        else:
+            if service_type != EmailServiceType.LUCKMAIL:
+                return {"applicable": False}
+            config = _normalize_email_service_config(EmailServiceType.LUCKMAIL, email_service_config or {}, proxy)
+
+    if not bool(config.get("reuse_existing_purchases", True)):
+        LuckMailService.clear_batch_reuse_pool(batch_id)
+        return {
+            "applicable": True,
+            "prepared_count": 0,
+            "requested_count": int(task_count or 0),
+            "reuse_enabled": False,
+            "service_name": service_name,
+        }
+
+    config = dict(config)
+    config["batch_id"] = batch_id
+    service = EmailServiceFactory.create(EmailServiceType.LUCKMAIL, config)
+    prepared_count = int(service.prepare_batch_reusable_inboxes(batch_id=batch_id, target_count=max(int(task_count or 0), 0)))
+    return {
+        "applicable": True,
+        "prepared_count": prepared_count,
+        "requested_count": int(task_count or 0),
+        "reuse_enabled": True,
+        "service_name": service_name,
+        "scan_pages": int(config.get("purchase_scan_pages") or 5),
+        "scan_page_size": int(config.get("purchase_scan_page_size") or 100),
+    }
+
+
+async def _prepare_luckmail_batch_reuse_pool(
+    batch_id: str,
+    task_uuids: List[str],
+    email_service_type: str,
+    proxy: Optional[str],
+    email_service_config: Optional[dict],
+    email_service_id: Optional[int],
+    add_batch_log: Callable[[str], None],
+) -> None:
+    try:
+        result = await asyncio.to_thread(
+            _prepare_luckmail_batch_reuse_pool_sync,
+            batch_id,
+            len(task_uuids),
+            email_service_type,
+            proxy,
+            email_service_config,
+            email_service_id,
+        )
+    except Exception as exc:
+        logger.warning(f"LuckMail 批量预扫描初始化失败，将回退到任务内逐个扫描: {exc}")
+        add_batch_log(f"[邮箱预热] LuckMail 批量预扫描初始化失败，回退逐任务扫描: {exc}")
+        return
+
+    if not result.get("applicable"):
+        return
+
+    if not result.get("reuse_enabled", True):
+        add_batch_log(
+            f"[邮箱预热] LuckMail 服务 {result.get('service_name') or 'luckmail'} 已关闭复用已购邮箱，后续任务将直接走新购/建单"
+        )
+        return
+
+    add_batch_log(
+        "[邮箱预热] LuckMail 批量预扫描完成: "
+        f"service={result.get('service_name') or 'luckmail'}, prepared={result.get('prepared_count', 0)}/{result.get('requested_count', 0)}, "
+        f"scan_pages={result.get('scan_pages', 0)}, page_size={result.get('scan_page_size', 0)}"
+    )
+    if int(result.get("prepared_count") or 0) <= 0:
+        add_batch_log("[邮箱预热] 当前没有可复用邮箱，后续任务将直接尝试新购/建单")
+
+
+def _cleanup_luckmail_batch_reuse_pool(batch_id: str) -> int:
+    from ...services.luckmail_mail import LuckMailService
+    return int(LuckMailService.clear_batch_reuse_pool(batch_id) or 0)
+
+
 async def run_batch_parallel(
     batch_id: str,
     task_uuids: List[str],
@@ -1284,6 +1397,7 @@ async def run_batch_parallel(
         queue.put_nowait((idx, task_uuid))
 
     add_batch_log(f"[系统] 并行模式启动，并发数: {max_workers}，总任务: {len(task_uuids)}")
+    await _prepare_luckmail_batch_reuse_pool(batch_id, task_uuids, email_service_type, proxy, email_service_config, email_service_id, add_batch_log)
 
     async def _record_task_result(idx: int, uuid: str):
         prefix = f"[任务{idx + 1}]"
@@ -1400,6 +1514,9 @@ async def run_batch_parallel(
         add_batch_log(f"[错误] 批量任务异常: {str(e)}")
         update_batch_status(finished=True, status="failed")
     finally:
+        released_reuse_inboxes = _cleanup_luckmail_batch_reuse_pool(batch_id)
+        if released_reuse_inboxes > 0:
+            add_batch_log(f"[邮箱预热] LuckMail 批量预扫描池已清理，释放未分配邮箱 {released_reuse_inboxes} 个")
         batch_tasks[batch_id]["finished"] = True
 
 
@@ -1435,6 +1552,7 @@ async def run_batch_pipeline(
     counter_lock = asyncio.Lock()
     running_tasks_list = []
     add_batch_log(f"[系统] 流水线模式启动，并发数: {concurrency}，总任务: {len(task_uuids)}")
+    await _prepare_luckmail_batch_reuse_pool(batch_id, task_uuids, email_service_type, proxy, email_service_config, email_service_id, add_batch_log)
 
     async def _run_and_release(idx: int, uuid: str, pfx: str):
         try:
@@ -1541,6 +1659,9 @@ async def run_batch_pipeline(
         add_batch_log(f"[错误] 批量任务异常: {str(e)}")
         update_batch_status(finished=True, status="failed")
     finally:
+        released_reuse_inboxes = _cleanup_luckmail_batch_reuse_pool(batch_id)
+        if released_reuse_inboxes > 0:
+            add_batch_log(f"[邮箱预热] LuckMail 批量预扫描池已清理，释放未分配邮箱 {released_reuse_inboxes} 个")
         batch_tasks[batch_id]["finished"] = True
 
 

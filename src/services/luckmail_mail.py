@@ -11,7 +11,7 @@ import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .base import BaseEmailService, EmailServiceError, EmailServiceType
 from ..config.constants import OTP_CODE_PATTERN
@@ -22,6 +22,10 @@ logger = logging.getLogger(__name__)
 _STATE_LOCK = threading.RLock()
 _INFLIGHT_EMAIL_TTL_SECONDS = 30 * 60
 _INFLIGHT_EMAILS: Dict[str, Dict[str, Any]] = {}
+_BATCH_REUSE_POOLS: Dict[str, List[Dict[str, Any]]] = {}
+_BATCH_REUSE_PREPARED: Set[str] = set()
+_BATCH_PURCHASE_GATES: Dict[str, threading.Lock] = {}
+_BATCH_PURCHASE_NEXT_ALLOWED_AT: Dict[str, float] = {}
 # 申诉硬编码开关（临时）：False=关闭申诉提交；True=开启申诉提交。
 LUCKMAIL_APPEAL_ENABLED = False
 
@@ -76,6 +80,22 @@ def _has_luckmail_rust_sdk_assets() -> bool:
             repo_root / "LuckMailSdk-Rust.zip",
         )
     )
+
+
+
+def _normalize_batch_key(value: Any) -> str:
+    return str(value or "").strip()
+
+def _get_batch_purchase_gate(batch_key: str) -> threading.Lock:
+    key = _normalize_batch_key(batch_key)
+    if not key:
+        raise ValueError("batch_key 不能为空")
+    with _STATE_LOCK:
+        gate = _BATCH_PURCHASE_GATES.get(key)
+        if gate is None:
+            gate = threading.Lock()
+            _BATCH_PURCHASE_GATES[key] = gate
+        return gate
 
 
 def _coerce_bool(value: Any, default: bool) -> bool:
@@ -143,7 +163,7 @@ class LuckMailService(BaseEmailService):
             "inbox_mode": "purchase",
             # 任务开始时优先复用“未在账号库且不在本地黑名单”的已购邮箱
             "reuse_existing_purchases": True,
-            "purchase_scan_pages": 5,
+            "purchase_scan_pages": 2,
             "purchase_scan_page_size": 100,
             "reuse_purchase_candidate_limit": 3,
             # 已购邮箱在真正投入流程前先做 token alive 检查，避免复用失活邮箱。
@@ -160,6 +180,7 @@ class LuckMailService(BaseEmailService):
             "max_retries": 3,
             "poll_interval": 3.0,
             "code_reuse_ttl": 600,
+            "batch_purchase_min_interval_seconds": 1.0,
         }
         self.config = {**default_config, **(config or {})}
 
@@ -191,6 +212,7 @@ class LuckMailService(BaseEmailService):
         self.config["token_mail_fallback"] = _coerce_bool(self.config.get("token_mail_fallback", True), True)
         self.config["poll_interval"] = float(self.config.get("poll_interval") or 3.0)
         self.config["code_reuse_ttl"] = int(self.config.get("code_reuse_ttl") or 600)
+        self.config["batch_purchase_min_interval_seconds"] = max(float(self.config.get("batch_purchase_min_interval_seconds") or 1.0), 0.0)
 
         if not self.config["api_key"]:
             raise ValueError("LuckMail 配置缺少 api_key")
@@ -578,6 +600,7 @@ class LuckMailService(BaseEmailService):
         project_code: str,
         email_type: str,
         preferred_domain: str,
+        batch_id: str = "",
     ) -> Dict[str, Any]:
         max_attempts = max(int(self.config.get("purchase_ready_retries") or 2), 1)
         last_error: Optional[EmailServiceError] = None
@@ -587,6 +610,7 @@ class LuckMailService(BaseEmailService):
                 project_code=project_code,
                 email_type=email_type,
                 preferred_domain=preferred_domain,
+                batch_id=batch_id,
             )
             email = self._normalize_email(order_info.get("email"))
             if not self._claim_email(email, order_info):
@@ -1216,12 +1240,12 @@ class LuckMailService(BaseEmailService):
             "source": source,
         }
 
-    def _pick_reusable_purchase_inbox(
+    def _build_reusable_purchase_candidates(
         self,
         project_code: str,
         email_type: str,
         preferred_domain: str,
-    ) -> Optional[Dict[str, Any]]:
+    ) -> List[Dict[str, Any]]:
         registered = self._load_email_index(self._registered_file)
         failed = self._load_email_index(self._failed_file)
         if self._reconcile_failed_over_registered(registered, failed):
@@ -1266,17 +1290,38 @@ class LuckMailService(BaseEmailService):
                 info["source"] = "resume_failed"
             candidates.append(info)
 
+        return candidates
+
+    def _reserve_reusable_purchase_inboxes(
+        self,
+        project_code: str,
+        email_type: str,
+        preferred_domain: str,
+        target_count: int = 1,
+        log_when_empty: bool = True,
+    ) -> List[Dict[str, Any]]:
+        desired_count = max(int(target_count or 1), 1)
+        candidates = self._build_reusable_purchase_candidates(
+            project_code=project_code,
+            email_type=email_type,
+            preferred_domain=preferred_domain,
+        )
         if not candidates:
-            logger.info(
-                "LuckMail 未找到可复用已购邮箱候选，跳过邮箱可用性检查并直接尝试新购: "
-                f"project_code={project_code}, email_type={email_type}, domain={preferred_domain or '-'}"
-            )
-            return None
+            if log_when_empty:
+                logger.info(
+                    "LuckMail 未找到可复用已购邮箱候选，跳过邮箱可用性检查并直接尝试新购: "
+                    f"project_code={project_code}, email_type={email_type}, domain={preferred_domain or '-'}"
+                )
+            return []
 
         existing_in_db = self._query_existing_account_emails({self._normalize_email(c.get("email")) for c in candidates})
-        probe_limit = int(self.config.get("reuse_purchase_candidate_limit") or 3)
+        probe_limit = max(int(self.config.get("reuse_purchase_candidate_limit") or 3), min(len(candidates), desired_count * 2))
         probed_candidates = 0
+        prepared: List[Dict[str, Any]] = []
+
         for info in candidates:
+            if len(prepared) >= desired_count:
+                break
             email = self._normalize_email(info.get("email"))
             if email in existing_in_db:
                 self._mark_registered_email(
@@ -1303,23 +1348,122 @@ class LuckMailService(BaseEmailService):
                 self._release_claimed_email(email)
                 logger.warning(f"LuckMail 复用邮箱探活未通过，已跳过: {email}")
                 continue
-            return info
-        return None
+            prepared.append(info)
 
-    def _create_order_inbox(
+        return prepared
+
+    def prepare_batch_reusable_inboxes(
+        self,
+        batch_id: str,
+        target_count: int,
+        project_code: Optional[str] = None,
+        email_type: Optional[str] = None,
+        preferred_domain: Optional[str] = None,
+    ) -> int:
+        batch_key = _normalize_batch_key(batch_id)
+        if not batch_key:
+            return 0
+        with _STATE_LOCK:
+            if batch_key in _BATCH_REUSE_PREPARED:
+                return len(_BATCH_REUSE_POOLS.get(batch_key) or [])
+
+        prepared = self._reserve_reusable_purchase_inboxes(
+            project_code=str(project_code or self.config.get("project_code") or "openai").strip(),
+            email_type=str(email_type or self.config.get("email_type") or "ms_graph").strip(),
+            preferred_domain=str(preferred_domain or self.config.get("preferred_domain") or "").strip().lstrip("@"),
+            target_count=max(int(target_count or 0), 0),
+            log_when_empty=True,
+        )
+
+        with _STATE_LOCK:
+            _BATCH_REUSE_POOLS[batch_key] = [dict(item) for item in prepared]
+            _BATCH_REUSE_PREPARED.add(batch_key)
+
+        logger.info(
+            f"LuckMail 批量预扫描完成: batch={batch_key}, prepared={len(prepared)}, requested={max(int(target_count or 0), 0)}"
+        )
+        return len(prepared)
+
+    @classmethod
+    def has_prepared_batch_reuse_pool(cls, batch_id: str) -> bool:
+        batch_key = _normalize_batch_key(batch_id)
+        if not batch_key:
+            return False
+        with _STATE_LOCK:
+            return batch_key in _BATCH_REUSE_PREPARED
+
+    @classmethod
+    def clear_batch_reuse_pool(cls, batch_id: str) -> int:
+        batch_key = _normalize_batch_key(batch_id)
+        if not batch_key:
+            return 0
+        released = 0
+        with _STATE_LOCK:
+            prepared = list(_BATCH_REUSE_POOLS.pop(batch_key, []))
+            _BATCH_REUSE_PREPARED.discard(batch_key)
+            for info in prepared:
+                email = str((info or {}).get("email") or "").strip().lower()
+                if not email:
+                    continue
+                _INFLIGHT_EMAILS.pop(email, None)
+                released += 1
+        return released
+
+    def _take_prepared_batch_reuse_inbox(self, batch_id: str) -> Optional[Dict[str, Any]]:
+        batch_key = _normalize_batch_key(batch_id)
+        if not batch_key:
+            return None
+        with _STATE_LOCK:
+            pool = _BATCH_REUSE_POOLS.get(batch_key) or []
+            if not pool:
+                return None
+            order_info = dict(pool.pop(0))
+            if not pool:
+                _BATCH_REUSE_POOLS[batch_key] = []
+        return order_info
+
+    def _run_batch_purchase_action(self, batch_id: str, action: str, func):
+        batch_key = _normalize_batch_key(batch_id)
+        if not batch_key:
+            return func()
+        gate = _get_batch_purchase_gate(batch_key)
+        min_interval = max(float(self.config.get("batch_purchase_min_interval_seconds") or 1.0), 0.0)
+        with gate:
+            wait_seconds = 0.0
+            with _STATE_LOCK:
+                next_allowed_at = float(_BATCH_PURCHASE_NEXT_ALLOWED_AT.get(batch_key) or 0.0)
+            now_ts = time.time()
+            if next_allowed_at > now_ts:
+                wait_seconds = next_allowed_at - now_ts
+            if wait_seconds > 0:
+                logger.info(
+                    f"LuckMail 批量新购节流等待: batch={batch_key}, action={action}, wait={wait_seconds:.2f}s"
+                )
+                time.sleep(wait_seconds)
+            try:
+                return func()
+            finally:
+                with _STATE_LOCK:
+                    _BATCH_PURCHASE_NEXT_ALLOWED_AT[batch_key] = time.time() + min_interval
+
+    def _create_order_inbox_impl(
         self,
         project_code: str,
         email_type: str,
         preferred_domain: str,
         specified_email: Optional[str] = None,
+        batch_id: str = "",
     ) -> Dict[str, Any]:
-        try:
-            order = self._backend_create_order(
+        def _request_order():
+            return self._backend_create_order(
                 project_code=project_code,
                 email_type=email_type,
                 preferred_domain=preferred_domain,
                 specified_email=specified_email,
             )
+
+        try:
+            order = self._run_batch_purchase_action(batch_id, "create_order", _request_order)
         except Exception as exc:
             self.update_status(False, exc)
             raise EmailServiceError(f"LuckMail 创建订单失败: {exc}")
@@ -1344,6 +1488,39 @@ class LuckMailService(BaseEmailService):
             "created_at": time.time(),
             "source": "new_order",
         }
+
+    def _pick_reusable_purchase_inbox(
+        self,
+        project_code: str,
+        email_type: str,
+        preferred_domain: str,
+    ) -> Optional[Dict[str, Any]]:
+        prepared = self._reserve_reusable_purchase_inboxes(
+            project_code=project_code,
+            email_type=email_type,
+            preferred_domain=preferred_domain,
+            target_count=1,
+            log_when_empty=True,
+        )
+        if not prepared:
+            return None
+        return prepared[0]
+
+    def _create_order_inbox(
+        self,
+        project_code: str,
+        email_type: str,
+        preferred_domain: str,
+        specified_email: Optional[str] = None,
+        batch_id: str = "",
+    ) -> Dict[str, Any]:
+        return self._create_order_inbox_impl(
+            project_code=project_code,
+            email_type=email_type,
+            preferred_domain=preferred_domain,
+            specified_email=specified_email,
+            batch_id=batch_id,
+        )
 
     def _extract_first_purchase_item(self, purchased: Any) -> Any:
         if purchased is None:
@@ -1377,14 +1554,18 @@ class LuckMailService(BaseEmailService):
         project_code: str,
         email_type: str,
         preferred_domain: str,
+        batch_id: str = "",
     ) -> Dict[str, Any]:
-        try:
-            purchased = self._backend_purchase_emails(
+        def _request_purchase():
+            return self._backend_purchase_emails(
                 project_code=project_code,
                 quantity=1,
                 email_type=email_type,
                 preferred_domain=preferred_domain,
             )
+
+        try:
+            purchased = self._run_batch_purchase_action(batch_id, "purchase_emails", _request_purchase)
         except Exception as exc:
             self.update_status(False, exc)
             raise EmailServiceError(f"LuckMail 购买邮箱失败: {exc}")
@@ -1427,6 +1608,8 @@ class LuckMailService(BaseEmailService):
             or self.config.get("preferred_domain")
             or ""
         ).strip().lstrip("@")
+        batch_id = _normalize_batch_key(request_config.get("batch_id") or self.config.get("batch_id"))
+
 
         inbox_mode = self._normalize_inbox_mode(
             request_config.get("inbox_mode") or request_config.get("mode") or self.config.get("inbox_mode")
@@ -1438,15 +1621,29 @@ class LuckMailService(BaseEmailService):
                 project_code=project_code,
                 email_type=email_type,
                 preferred_domain=preferred_domain,
+                batch_id=batch_id,
             )
         else:
             try:
                 if bool(self.config.get("reuse_existing_purchases", True)):
-                    reused = self._pick_reusable_purchase_inbox(
-                        project_code=project_code,
-                        email_type=email_type,
-                        preferred_domain=preferred_domain,
-                    )
+                    reused = None
+                    if batch_id and self.has_prepared_batch_reuse_pool(batch_id):
+                        reused = self._take_prepared_batch_reuse_inbox(batch_id)
+                        if reused:
+                            logger.info(
+                                f"LuckMail 批量预扫描分发复用邮箱: batch={batch_id}, email={reused.get('email') or '-'}"
+                            )
+                        else:
+                            logger.info(
+                                "LuckMail 批量预扫描池已空，跳过复用扫描并直接尝试新购: "
+                                f"batch={batch_id}, project_code={project_code}, email_type={email_type}, domain={preferred_domain or '-'}"
+                            )
+                    else:
+                        reused = self._pick_reusable_purchase_inbox(
+                            project_code=project_code,
+                            email_type=email_type,
+                            preferred_domain=preferred_domain,
+                        )
                     if reused:
                         order_info = reused
                         claimed_in_picker = True
@@ -1455,6 +1652,7 @@ class LuckMailService(BaseEmailService):
                             project_code=project_code,
                             email_type=email_type,
                             preferred_domain=preferred_domain,
+                            batch_id=batch_id,
                         )
                         claimed_in_picker = True
                 else:
@@ -1462,6 +1660,7 @@ class LuckMailService(BaseEmailService):
                         project_code=project_code,
                         email_type=email_type,
                         preferred_domain=preferred_domain,
+                        batch_id=batch_id,
                     )
                     claimed_in_picker = True
             except EmailServiceError as exc:
@@ -1478,6 +1677,7 @@ class LuckMailService(BaseEmailService):
                     project_code=project_code,
                     email_type=email_type,
                     preferred_domain=preferred_domain,
+                    batch_id=batch_id,
                 )
                 order_info["source"] = "purchase_no_stock_fallback_order"
             else:
