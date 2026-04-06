@@ -164,7 +164,7 @@ class LuckMailService(BaseEmailService):
             "inbox_mode": "purchase",
             # 任务开始时优先复用“未在账号库且不在本地黑名单”的已购邮箱
             "reuse_existing_purchases": True,
-            "purchase_scan_pages": 2,
+            "purchase_scan_pages": 5,
             "purchase_scan_page_size": 100,
             "reuse_purchase_candidate_limit": 3,
             # 已购邮箱在真正投入流程前先做 token alive 检查，避免复用失活邮箱。

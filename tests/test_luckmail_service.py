@@ -171,6 +171,15 @@ def build_service(monkeypatch, user, config=None, python_client_cls=FakeClient, 
     return service
 
 
+def test_luckmail_defaults_use_wider_purchase_prescan_window(monkeypatch):
+    user = FakeUser()
+
+    service = build_service(monkeypatch, user)
+
+    assert service.config["purchase_scan_pages"] == 5
+    assert service.config["purchase_scan_page_size"] == 100
+
+
 def test_create_email_skips_reused_purchase_that_fails_alive(monkeypatch):
     user = FakeUser()
     user.purchase_pages = [[

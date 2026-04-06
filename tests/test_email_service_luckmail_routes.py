@@ -123,6 +123,8 @@ def test_email_service_types_include_luckmail_compat_fields():
     assert "sdk_preference" in field_names
     assert "inbox_mode" in field_names
     assert "reuse_existing_purchases" in field_names
+    assert "purchase_scan_pages" in field_names
+    assert "purchase_scan_page_size" in field_names
     assert "ensure_purchase_ready" in field_names
     assert "reuse_purchase_candidate_limit" in field_names
     assert "token_alive_timeout" in field_names
@@ -141,6 +143,8 @@ def test_normalize_email_service_config_coerces_luckmail_values():
             "sdk_preference": " rust ",
             "inbox_mode": " purchase ",
             "reuse_existing_purchases": "false",
+            "purchase_scan_pages": "8",
+            "purchase_scan_page_size": "120",
             "ensure_purchase_ready": "true",
             "reuse_purchase_candidate_limit": "2",
             "token_alive_timeout": "15",
@@ -156,6 +160,8 @@ def test_normalize_email_service_config_coerces_luckmail_values():
     assert normalized["sdk_preference"] == "rust"
     assert normalized["inbox_mode"] == "purchase"
     assert normalized["reuse_existing_purchases"] is False
+    assert normalized["purchase_scan_pages"] == 8
+    assert normalized["purchase_scan_page_size"] == 120
     assert normalized["ensure_purchase_ready"] is True
     assert normalized["reuse_purchase_candidate_limit"] == 2
     assert normalized["token_alive_timeout"] == 15

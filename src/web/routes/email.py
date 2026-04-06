@@ -446,6 +446,8 @@ async def get_service_types():
                     {"name": "sdk_preference", "label": "SDK 优先级", "required": False, "default": "auto", "placeholder": "auto / rust / python"},
                     {"name": "inbox_mode", "label": "收件模式", "required": False, "default": "purchase", "placeholder": "purchase / order"},
                     {"name": "reuse_existing_purchases", "label": "复用已购邮箱", "required": False, "default": True, "placeholder": "true / false"},
+                    {"name": "purchase_scan_pages", "label": "预扫描页数", "required": False, "default": 5, "type": "number"},
+                    {"name": "purchase_scan_page_size", "label": "预扫描每页数量", "required": False, "default": 100, "type": "number"},
                     {"name": "ensure_purchase_ready", "label": "先做邮箱可用性检查", "required": False, "default": True, "placeholder": "true / false"},
                     {"name": "reuse_purchase_candidate_limit", "label": "复用探测候选上限", "required": False, "default": 3, "type": "number"},
                     {"name": "token_alive_timeout", "label": "探活超时(秒)", "required": False, "default": 20, "type": "number"},
