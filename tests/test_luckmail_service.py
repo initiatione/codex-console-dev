@@ -1,4 +1,5 @@
 import logging
+import pytest
 import importlib.util
 import sys
 import types
@@ -139,6 +140,8 @@ def build_service(monkeypatch, user, config=None, python_client_cls=FakeClient, 
     else:
         monkeypatch.setattr(luckmail_module, "_load_luckmail_client_class", lambda: (python_client_cls, "python:test"))
     monkeypatch.setattr(luckmail_module, "_has_luckmail_rust_sdk_assets", lambda: True)
+    monkeypatch.setattr(luckmail_module, "_NO_STOCK_BREAKERS", {})
+    monkeypatch.setattr(luckmail_module, "_NO_STOCK_SHUTDOWN_REQUESTED", False)
     monkeypatch.setattr(luckmail_module, "_BATCH_REUSE_POOLS", {})
     monkeypatch.setattr(luckmail_module, "_BATCH_REUSE_PREPARED", set())
     monkeypatch.setattr(
@@ -669,3 +672,73 @@ def test_create_order_uses_batch_gate_when_batch_id_present(monkeypatch):
 
     assert result["order_no"] == "ord-batch-1"
     assert gate_calls == [("batch-order", "create_order")]
+
+def test_repeated_no_stock_requests_process_exit(monkeypatch):
+    user = FakeUser()
+    user.create_order_results = [
+        RuntimeError('LuckMail Rust CLI 执行失败: Error: Api { code: 2003, message: "无库存", data: None }'),
+        RuntimeError('LuckMail Rust CLI 执行失败: Error: Api { code: 2003, message: "无库存", data: None }'),
+    ]
+
+    service = build_service(
+        monkeypatch,
+        user,
+        config={
+            "inbox_mode": "order",
+            "no_stock_shutdown_threshold": 2,
+            "no_stock_shutdown_window_seconds": 60,
+            "no_stock_shutdown_exit_delay_seconds": 0,
+        },
+    )
+    exit_requests = []
+    monkeypatch.setattr(
+        luckmail_module,
+        "_schedule_luckmail_no_stock_process_exit",
+        lambda reason, delay_seconds=0.5: exit_requests.append((reason, delay_seconds)),
+    )
+
+    with pytest.raises(luckmail_module.EmailServiceError, match="创建订单失败"):
+        service.create_email({"batch_id": "batch-stop"})
+
+    with pytest.raises(luckmail_module.EmailServiceError, match="连续无库存触发熔断"):
+        service.create_email({"batch_id": "batch-stop"})
+
+    assert exit_requests
+    assert "batch-stop" in exit_requests[0][0]
+    assert exit_requests[0][1] == 0
+
+
+def test_success_resets_no_stock_breaker(monkeypatch):
+    user = FakeUser()
+    user.create_order_results = [
+        RuntimeError('LuckMail Rust CLI 执行失败: Error: Api { code: 2003, message: "无库存", data: None }'),
+        {"order_no": "ord-reset", "email_address": "reset@example.com"},
+        RuntimeError('LuckMail Rust CLI 执行失败: Error: Api { code: 2003, message: "无库存", data: None }'),
+    ]
+
+    service = build_service(
+        monkeypatch,
+        user,
+        config={
+            "inbox_mode": "order",
+            "no_stock_shutdown_threshold": 2,
+            "no_stock_shutdown_window_seconds": 60,
+        },
+    )
+    exit_requests = []
+    monkeypatch.setattr(
+        luckmail_module,
+        "_schedule_luckmail_no_stock_process_exit",
+        lambda reason, delay_seconds=0.5: exit_requests.append((reason, delay_seconds)),
+    )
+
+    with pytest.raises(luckmail_module.EmailServiceError, match="创建订单失败"):
+        service.create_email({"batch_id": "batch-reset"})
+
+    result = service.create_email({"batch_id": "batch-reset"})
+    assert result["order_no"] == "ord-reset"
+
+    with pytest.raises(luckmail_module.EmailServiceError, match="创建订单失败"):
+        service.create_email({"batch_id": "batch-reset"})
+
+    assert exit_requests == []

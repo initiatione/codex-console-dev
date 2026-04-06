@@ -75,3 +75,4 @@
 
 - 修复注册任务在 about-you 阶段可能无限卡住的问题：Sentinel Browser 调用 window.SentinelSDK.token(flow) 时新增浏览器侧超时兜底，避免单个任务长时间停留在 running 并拖住批量进度。
 
+- 修复 LuckMail 连续无库存时的失控空转：仅在 `src/services/luckmail_mail.py` 内新增“无库存熔断”逻辑，按批次统计短时间内连续 `code=2003/无库存` 返回；达到阈值后当前任务立即失败，并发出进程退出请求，阻止后续 LuckMail 任务继续空转。默认阈值为 5 次、窗口 60 秒、退出延迟 0.5 秒；同时补充 LuckMail 定向测试覆盖“触发熔断”和“成功后重置计数”两条路径。
