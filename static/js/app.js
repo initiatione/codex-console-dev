@@ -32,6 +32,7 @@ let availableServices = {
     moe_mail: { available: false, services: [] },
     temp_mail: { available: false, services: [] },
     cloudmail: { available: false, services: [] },
+    duckduckgo_cloudmail: { available: false, services: [] },
     duck_mail: { available: false, services: [] },
     luckmail: { available: false, services: [] },
     freemail: { available: false, services: [] },
@@ -481,6 +482,23 @@ function updateEmailServiceOptions() {
         select.appendChild(optgroup);
     }
 
+    // DuckDuckGo-CloudMail
+    if (availableServices.duckduckgo_cloudmail && availableServices.duckduckgo_cloudmail.available) {
+        const optgroup = document.createElement('optgroup');
+        optgroup.label = `🦆 DuckDuckGo-CloudMail (${availableServices.duckduckgo_cloudmail.count} 个服务)`;
+
+        availableServices.duckduckgo_cloudmail.services.forEach(service => {
+            const option = document.createElement('option');
+            option.value = `duckduckgo_cloudmail:${service.id}`;
+            option.textContent = service.name + (service.forward_to_email ? ` (${service.forward_to_email})` : '');
+            option.dataset.type = 'duckduckgo_cloudmail';
+            option.dataset.serviceId = service.id;
+            optgroup.appendChild(option);
+        });
+
+        select.appendChild(optgroup);
+    }
+
     // DuckMail
     if (availableServices.duck_mail && availableServices.duck_mail.available) {
         const optgroup = document.createElement('optgroup');
@@ -597,6 +615,11 @@ function handleServiceChange(e) {
         const service = availableServices.cloudmail.services.find(s => s.id == id);
         if (service) {
             addLog('info', `[系统] 已选择 CloudMail 服务: ${service.name}`);
+        }
+    } else if (type === 'duckduckgo_cloudmail') {
+        const service = availableServices.duckduckgo_cloudmail.services.find(s => s.id == id);
+        if (service) {
+            addLog('info', `[系统] 已选择 DuckDuckGo-CloudMail 服务: ${service.name}`);
         }
     } else if (type === 'duck_mail') {
         const service = availableServices.duck_mail.services.find(s => s.id == id);

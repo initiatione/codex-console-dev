@@ -669,6 +669,7 @@ const statusMap = {
         outlook: 'Outlook / Hotmail',
         moe_mail: 'MoeMail',
         temp_mail: 'Temp-Mail（自部署）',
+        duckduckgo_cloudmail: 'DuckDuckGo-CloudMail',
         duck_mail: 'DuckMail',
         freemail: 'Freemail',
         imap_mail: 'IMAP 邮箱'
