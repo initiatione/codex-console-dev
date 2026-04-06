@@ -2,6 +2,10 @@
 
 ## v1.1.3
 
+- 调整 LuckMail 预扫描探活的超时处理：`timeout / network / TLS / connection reset` 等抖动类失败不再直接记入失败邮箱索引；批量预扫描会先走一轮快探活，若仍未准备够共享池，再仅对“暂时失败”的候选发起一轮更宽松的二次探活，降低瞬时链路抖动导致的误杀。
+
+- 优化 LuckMail 批量预扫描体验：复用邮箱的 alive 探活现支持受控并发，新增 `batch_reuse_probe_workers` / `batch_reuse_probe_limit` / `batch_reuse_probe_request_timeout_seconds` 三个配置项；同时为预扫描补充终端动态进度条渲染，并修复并发探活下失败/已注册索引写入的线程安全问题，减少大批量启动前长时间卡在单线程预热的情况。
+
 - 统一 LuckMail 预扫描范围配置：默认 `purchase_scan_pages` 现与运行时归一化逻辑统一为 `5`，并在邮箱服务配置项中补充 `purchase_scan_pages` / `purchase_scan_page_size`，便于直接放大批量统一预扫描范围；同时补充对应回归测试。
 
 - 继续优化 LuckMail 批量注册在共享池为空后的新购链路：新增按批次串行的 `purchase_emails` / `create_order` 节流门，并设置最小请求间隔，减少批量高并发下的“操作过于频繁”与库存接口抖动；补充对应回归测试。

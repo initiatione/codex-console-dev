@@ -9,9 +9,10 @@ import sys
 import threading
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from .base import BaseEmailService, EmailServiceError, EmailServiceType
 from ..config.constants import OTP_CODE_PATTERN
@@ -167,6 +168,10 @@ class LuckMailService(BaseEmailService):
             "purchase_scan_pages": 5,
             "purchase_scan_page_size": 100,
             "reuse_purchase_candidate_limit": 3,
+            "batch_reuse_probe_workers": 8,
+            "batch_reuse_probe_limit": 24,
+            "batch_reuse_probe_request_timeout_seconds": 2,
+            "batch_reuse_probe_allow_python_fallback": False,
             # 已购邮箱在真正投入流程前先做 token alive 检查，避免复用失活邮箱。
             "ensure_purchase_ready": True,
             "token_alive_timeout": 20,
@@ -206,6 +211,16 @@ class LuckMailService(BaseEmailService):
         self.config["purchase_scan_pages"] = max(int(self.config.get("purchase_scan_pages") or 5), 1)
         self.config["purchase_scan_page_size"] = max(int(self.config.get("purchase_scan_page_size") or 100), 1)
         self.config["reuse_purchase_candidate_limit"] = max(int(self.config.get("reuse_purchase_candidate_limit") or 3), 1)
+        self.config["batch_reuse_probe_workers"] = max(int(self.config.get("batch_reuse_probe_workers") or 8), 1)
+        self.config["batch_reuse_probe_limit"] = max(int(self.config.get("batch_reuse_probe_limit") or 24), 1)
+        self.config["batch_reuse_probe_request_timeout_seconds"] = max(
+            int(self.config.get("batch_reuse_probe_request_timeout_seconds") or 2),
+            1,
+        )
+        self.config["batch_reuse_probe_allow_python_fallback"] = _coerce_bool(
+            self.config.get("batch_reuse_probe_allow_python_fallback", False),
+            False,
+        )
         self.config["ensure_purchase_ready"] = _coerce_bool(self.config.get("ensure_purchase_ready", True), True)
         self.config["token_alive_timeout"] = max(int(self.config.get("token_alive_timeout") or 20), 1)
         self.config["token_alive_request_timeout"] = max(int(self.config.get("token_alive_request_timeout") or 4), 1)
@@ -518,12 +533,19 @@ class LuckMailService(BaseEmailService):
             python_call = lambda: self.client.user.purchase_emails(**kwargs)
         return self._call_preferred_backend("purchase_emails", rust_call=rust_call, python_call=python_call)
 
-    def _backend_check_token_alive(self, token: str, request_timeout_seconds: Optional[int] = None):
+    def _backend_check_token_alive(
+        self,
+        token: str,
+        request_timeout_seconds: Optional[int] = None,
+        allow_python_fallback: bool = True,
+    ):
         rust_call = None
         if self._rust_backend is not None:
             rust_call = lambda: self._rust_backend.check_token_alive(token, timeout_seconds=request_timeout_seconds)
         python_alive_method = getattr(getattr(self.client, "user", None), "check_token_alive", None)
-        python_call = (lambda: python_alive_method(token)) if callable(python_alive_method) else None
+        python_call = None
+        if callable(python_alive_method) and (allow_python_fallback or self._rust_backend is None or self.config.get("sdk_preference") == "python"):
+            python_call = lambda: python_alive_method(token)
         return self._call_preferred_backend("check_token_alive", rust_call=rust_call, python_call=python_call)
 
     def _backend_get_token_code(self, token: str):
@@ -617,6 +639,43 @@ class LuckMailService(BaseEmailService):
             )
         )
 
+    def _is_transient_alive_text(self, text: str) -> bool:
+        text_value = str(text or "").strip().lower()
+        if not text_value:
+            return False
+        markers = (
+            "timeout",
+            "timed out",
+            "deadline exceeded",
+            "context deadline exceeded",
+            "connection reset",
+            "connection closed abruptly",
+            "tls connect error",
+            "network error",
+            "awaiting headers",
+            "read tcp",
+            "operation timed out",
+            "请求失败",
+            "连接重置",
+            "超时",
+            "网络错误",
+        )
+        return any(marker in text_value for marker in markers)
+
+    def _classify_alive_failure(
+        self,
+        status: str,
+        message: str,
+        error: Optional[Exception] = None,
+    ) -> str:
+        if error is not None and self._is_transient_alive_text(str(error)):
+            return "transient"
+        if self._is_terminal_alive_status(status, message):
+            return "terminal"
+        if self._is_transient_alive_text(status) or self._is_transient_alive_text(message):
+            return "transient"
+        return "unknown"
+
     def _record_unavailable_purchase(self, order_info: Dict[str, Any], reason: str) -> None:
         email = self._normalize_email(order_info.get("email"))
         if not email:
@@ -631,7 +690,12 @@ class LuckMailService(BaseEmailService):
         }
         self._mark_failed_email(email, reason=reason, extra=extra)
 
-    def _ensure_purchase_inbox_ready(self, order_info: Dict[str, Any]) -> bool:
+    def _ensure_purchase_inbox_ready(
+        self,
+        order_info: Dict[str, Any],
+        request_timeout_seconds: Optional[int] = None,
+        allow_python_fallback: bool = True,
+    ) -> bool:
         if not bool(self.config.get("ensure_purchase_ready", True)):
             return True
         if self._normalize_inbox_mode(order_info.get("inbox_mode")) != "purchase":
@@ -650,18 +714,27 @@ class LuckMailService(BaseEmailService):
         source = str(order_info.get("source") or "").strip().lower()
         max_attempts = 1 if source in {"reuse_purchase", "resume_failed"} else 2
         deadline = time.time() + max(int(self.config.get("token_alive_timeout") or 20), 1)
-        request_timeout = max(int(self.config.get("token_alive_request_timeout") or 4), 1)
+        request_timeout = max(
+            int(request_timeout_seconds or self.config.get("token_alive_request_timeout") or 4),
+            1,
+        )
         poll_interval = max(float(self.config.get("token_alive_poll_interval") or 2.0), 0.2)
         last_status = ""
         last_message = ""
         last_mail_count: Any = None
         last_error: Optional[Exception] = None
+        order_info.pop("_alive_failure_kind", None)
+        order_info.pop("_alive_failure_detail", None)
 
         for attempt in range(1, max_attempts + 1):
             remaining_seconds = max(int(deadline - time.time()), 1)
             effective_timeout = max(min(request_timeout, remaining_seconds), 1)
             try:
-                result = self._backend_check_token_alive(token, request_timeout_seconds=effective_timeout)
+                result = self._backend_check_token_alive(
+                    token,
+                    request_timeout_seconds=effective_timeout,
+                    allow_python_fallback=allow_python_fallback,
+                )
                 alive = bool(self._extract_field(result, "alive"))
                 status = str(self._extract_field(result, "status") or "").strip().lower()
                 message = str(self._extract_field(result, "message") or "").strip()
@@ -684,15 +757,55 @@ class LuckMailService(BaseEmailService):
             time.sleep(min(poll_interval, max(deadline - time.time(), 0.0)))
 
         if last_error is not None:
+            failure_kind = self._classify_alive_failure(last_status, last_message, error=last_error)
+            order_info["_alive_failure_kind"] = failure_kind
+            order_info["_alive_failure_detail"] = str(last_error)
             logger.warning(f"LuckMail 邮箱可用性检查失败: email={email}, error={last_error}")
             self.update_status(False, last_error)
         else:
+            failure_kind = self._classify_alive_failure(last_status, last_message)
+            order_info["_alive_failure_kind"] = failure_kind
+            order_info["_alive_failure_detail"] = last_message or last_status or ""
             logger.warning(
                 "LuckMail 邮箱可用性检查未通过: "
                 f"email={email}, status={last_status or '-'}, message={last_message or '-'}, "
                 f"mail_count={last_mail_count if last_mail_count not in (None, '') else '-'}"
             )
         return False
+
+    def _probe_reusable_purchase_candidate(
+        self,
+        info: Dict[str, Any],
+        request_timeout_seconds: Optional[int] = None,
+        allow_python_fallback: bool = False,
+    ) -> Tuple[str, Optional[Dict[str, Any]]]:
+        email = self._normalize_email(info.get("email"))
+        if not email:
+            return "invalid", None
+        if not self._claim_email(email, info):
+            logger.info(f"LuckMail 复用邮箱已被当前批次占用，跳过: {email}")
+            return "claimed", None
+
+        try:
+            if self._ensure_purchase_inbox_ready(
+                info,
+                request_timeout_seconds=request_timeout_seconds,
+                allow_python_fallback=allow_python_fallback,
+            ):
+                return "ready", info
+        except Exception as exc:
+            logger.warning(f"LuckMail 复用邮箱探活异常，已跳过: {email}, error={exc}")
+
+        failure_kind = str(info.get("_alive_failure_kind") or "").strip().lower()
+        self._release_claimed_email(email)
+        if failure_kind == "transient":
+            logger.warning(f"LuckMail 复用邮箱探活暂时失败，保留待重试: {email}")
+            return "transient", dict(info)
+
+        reason = f"LuckMail 邮箱可用性检查失败: {email}"
+        self._record_unavailable_purchase(info, reason)
+        logger.warning(f"LuckMail 复用邮箱探活未通过，已跳过: {email}")
+        return "failed", None
 
     def _create_ready_purchase_inbox(
         self,
@@ -720,11 +833,16 @@ class LuckMailService(BaseEmailService):
                 return order_info
 
             reason = f"LuckMail 邮箱可用性检查失败: {email}"
-            self._record_unavailable_purchase(order_info, reason)
+            failure_kind = str(order_info.get("_alive_failure_kind") or "").strip().lower()
+            if failure_kind != "transient":
+                self._record_unavailable_purchase(order_info, reason)
             self._release_claimed_email(email)
             last_error = EmailServiceError(reason)
             if attempt < max_attempts:
-                logger.warning(f"LuckMail 新购邮箱探活未通过，准备重试购买: {email} ({attempt}/{max_attempts})")
+                if failure_kind == "transient":
+                    logger.warning(f"LuckMail 新购邮箱探活暂时失败，准备重试购买: {email} ({attempt}/{max_attempts})")
+                else:
+                    logger.warning(f"LuckMail 新购邮箱探活未通过，准备重试购买: {email} ({attempt}/{max_attempts})")
 
         if last_error is not None:
             raise last_error
@@ -989,18 +1107,19 @@ class LuckMailService(BaseEmailService):
         email_norm = self._normalize_email(email)
         if not email_norm:
             return
-        registered = self._load_email_index(self._registered_file)
-        failed = self._load_email_index(self._failed_file)
-        record = registered.get(email_norm, {"email": email_norm})
-        record["updated_at"] = self._now_iso()
-        if extra:
-            for k, v in extra.items():
-                if v is not None and v != "":
-                    record[k] = v
-        registered[email_norm] = record
-        failed.pop(email_norm, None)
-        self._save_email_index(self._registered_file, registered)
-        self._save_email_index(self._failed_file, failed)
+        with _STATE_LOCK:
+            registered = self._load_email_index(self._registered_file)
+            failed = self._load_email_index(self._failed_file)
+            record = registered.get(email_norm, {"email": email_norm})
+            record["updated_at"] = self._now_iso()
+            if extra:
+                for k, v in extra.items():
+                    if v is not None and v != "":
+                        record[k] = v
+            registered[email_norm] = record
+            failed.pop(email_norm, None)
+            self._save_email_index(self._registered_file, registered)
+            self._save_email_index(self._failed_file, failed)
 
     def _should_force_failed_record(self, reason: str) -> bool:
         text = str(reason or "").strip().lower()
@@ -1043,31 +1162,32 @@ class LuckMailService(BaseEmailService):
         if not email_norm:
             return {}
 
-        registered = self._load_email_index(self._registered_file)
-        registered_record: Dict[str, Any] = {}
-        if email_norm in registered:
-            if not prefer_failed:
-                return registered.get(email_norm) or {}
-            registered_record = dict(registered.get(email_norm) or {})
-            registered.pop(email_norm, None)
-            self._save_email_index(self._registered_file, registered)
+        with _STATE_LOCK:
+            registered = self._load_email_index(self._registered_file)
+            registered_record: Dict[str, Any] = {}
+            if email_norm in registered:
+                if not prefer_failed:
+                    return registered.get(email_norm) or {}
+                registered_record = dict(registered.get(email_norm) or {})
+                registered.pop(email_norm, None)
+                self._save_email_index(self._registered_file, registered)
 
-        failed = self._load_email_index(self._failed_file)
-        record = failed.get(email_norm, {"email": email_norm, "fail_count": 0})
-        for k, v in registered_record.items():
-            if k not in record and v not in (None, ""):
-                record[k] = v
-        record["fail_count"] = int(record.get("fail_count") or 0) + 1
-        record["updated_at"] = self._now_iso()
-        if reason:
-            record["reason"] = reason[:500]
-        if extra:
-            for k, v in extra.items():
-                if v is not None and v != "":
+            failed = self._load_email_index(self._failed_file)
+            record = failed.get(email_norm, {"email": email_norm, "fail_count": 0})
+            for k, v in registered_record.items():
+                if k not in record and v not in (None, ""):
                     record[k] = v
-        failed[email_norm] = record
-        self._save_email_index(self._failed_file, failed)
-        return record
+            record["fail_count"] = int(record.get("fail_count") or 0) + 1
+            record["updated_at"] = self._now_iso()
+            if reason:
+                record["reason"] = reason[:500]
+            if extra:
+                for k, v in extra.items():
+                    if v is not None and v != "":
+                        record[k] = v
+            failed[email_norm] = record
+            self._save_email_index(self._failed_file, failed)
+            return record
 
     def mark_registration_outcome(
         self,
@@ -1391,6 +1511,181 @@ class LuckMailService(BaseEmailService):
 
         return candidates
 
+    def _reserve_reusable_purchase_inboxes_parallel(
+        self,
+        probe_items: List[Tuple[int, Dict[str, Any]]],
+        desired_count: int,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> List[Dict[str, Any]]:
+        worker_count = min(
+            max(int(self.config.get("batch_reuse_probe_workers") or 8), 1),
+            max(len(probe_items), 1),
+        )
+        probe_cap = max(int(self.config.get("batch_reuse_probe_limit") or 24), 1)
+        probe_limit = min(
+            len(probe_items),
+            max(
+                int(self.config.get("reuse_purchase_candidate_limit") or 3),
+                min(max(int(desired_count or 1), 1) * 2, probe_cap),
+            ),
+        )
+        request_timeout_seconds = max(
+            int(self.config.get("batch_reuse_probe_request_timeout_seconds") or 2),
+            1,
+        )
+        allow_python_fallback = bool(self.config.get("batch_reuse_probe_allow_python_fallback", False))
+        selected_items = probe_items[:probe_limit]
+        if not selected_items:
+            return []
+        total_units = len(selected_items)
+
+        logger.info(
+            "LuckMail 批量预扫描启用并发探活: "
+            f"workers={worker_count}, probe_limit={probe_limit}, request_timeout={request_timeout_seconds}s, "
+            f"allow_python_fallback={allow_python_fallback}, "
+            f"desired={desired_count}, candidates={len(probe_items)}"
+        )
+
+        processed = 0
+        failed_count = 0
+        skipped_count = 0
+        transient_items: List[Tuple[int, Dict[str, Any]]] = []
+        prepared_by_index: Dict[int, Dict[str, Any]] = {}
+        if progress_callback:
+            progress_callback(
+                {
+                    "phase": "running",
+                    "mode": "parallel",
+                    "processed": 0,
+                    "total": len(selected_items),
+                    "prepared": 0,
+                    "failed": 0,
+                    "skipped": 0,
+                    "workers": worker_count,
+                }
+            )
+
+        with ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="luckmail_reuse_probe",
+        ) as executor:
+            future_map = {
+                executor.submit(
+                    self._probe_reusable_purchase_candidate,
+                    dict(info),
+                    request_timeout_seconds,
+                    allow_python_fallback,
+                ): index
+                for index, info in selected_items
+            }
+            for future in as_completed(future_map):
+                status, ready_info = future.result()
+                processed += 1
+                if status == "ready" and ready_info:
+                    prepared_by_index[future_map[future]] = ready_info
+                elif status == "transient" and ready_info:
+                    transient_items.append((future_map[future], ready_info))
+                elif status == "failed":
+                    failed_count += 1
+                else:
+                    skipped_count += 1
+                if progress_callback:
+                    progress_callback(
+                        {
+                            "phase": "running",
+                            "mode": "parallel",
+                            "processed": processed,
+                            "total": len(selected_items),
+                            "prepared": len(prepared_by_index),
+                            "failed": failed_count,
+                            "skipped": skipped_count,
+                            "workers": worker_count,
+                        }
+                    )
+
+        remaining_needed = max(desired_count - len(prepared_by_index), 0)
+        if remaining_needed > 0 and transient_items:
+            retry_timeout = max(
+                int(self.config.get("token_alive_request_timeout") or 4),
+                request_timeout_seconds * 3,
+            )
+            retry_worker_count = min(max(1, min(4, worker_count)), len(transient_items))
+            retry_limit = min(len(transient_items), max(remaining_needed * 2, remaining_needed))
+            total_units += retry_limit
+            logger.info(
+                "LuckMail 批量预扫描对暂时失败候选发起二次探活: "
+                f"retry_limit={retry_limit}, retry_workers={retry_worker_count}, retry_timeout={retry_timeout}s"
+            )
+            if progress_callback:
+                progress_callback(
+                        {
+                            "phase": "retrying",
+                            "mode": "parallel_retry",
+                            "processed": processed,
+                            "total": total_units,
+                            "prepared": len(prepared_by_index),
+                            "failed": failed_count,
+                            "skipped": skipped_count,
+                            "workers": retry_worker_count,
+                        }
+                )
+            with ThreadPoolExecutor(
+                max_workers=retry_worker_count,
+                thread_name_prefix="luckmail_reuse_retry",
+            ) as executor:
+                retry_futures = {
+                    executor.submit(
+                        self._probe_reusable_purchase_candidate,
+                        dict(info),
+                        retry_timeout,
+                        True,
+                    ): index
+                    for index, info in transient_items[:retry_limit]
+                }
+                for future in as_completed(retry_futures):
+                    status, ready_info = future.result()
+                    processed += 1
+                    if status == "ready" and ready_info:
+                        prepared_by_index[retry_futures[future]] = ready_info
+                    elif status == "failed":
+                        failed_count += 1
+                    else:
+                        skipped_count += 1
+                    if progress_callback:
+                        progress_callback(
+                        {
+                            "phase": "retrying",
+                            "mode": "parallel_retry",
+                            "processed": processed,
+                            "total": total_units,
+                            "prepared": len(prepared_by_index),
+                            "failed": failed_count,
+                            "skipped": skipped_count,
+                            "workers": retry_worker_count,
+                            }
+                        )
+
+        prepared: List[Dict[str, Any]] = []
+        for index in sorted(prepared_by_index.keys()):
+            prepared.append(prepared_by_index[index])
+            if len(prepared) >= desired_count:
+                break
+
+        if progress_callback:
+            progress_callback(
+                {
+                    "phase": "done",
+                    "mode": "parallel",
+                    "processed": processed,
+                    "total": total_units,
+                    "prepared": len(prepared),
+                    "failed": failed_count,
+                    "skipped": skipped_count,
+                    "workers": worker_count,
+                }
+            )
+        return prepared
+
     def _reserve_reusable_purchase_inboxes(
         self,
         project_code: str,
@@ -1398,6 +1693,7 @@ class LuckMailService(BaseEmailService):
         preferred_domain: str,
         target_count: int = 1,
         log_when_empty: bool = True,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> List[Dict[str, Any]]:
         desired_count = max(int(target_count or 1), 1)
         candidates = self._build_reusable_purchase_candidates(
@@ -1414,13 +1710,8 @@ class LuckMailService(BaseEmailService):
             return []
 
         existing_in_db = self._query_existing_account_emails({self._normalize_email(c.get("email")) for c in candidates})
-        probe_limit = max(int(self.config.get("reuse_purchase_candidate_limit") or 3), min(len(candidates), desired_count * 2))
-        probed_candidates = 0
-        prepared: List[Dict[str, Any]] = []
-
+        probe_items: List[Tuple[int, Dict[str, Any]]] = []
         for info in candidates:
-            if len(prepared) >= desired_count:
-                break
             email = self._normalize_email(info.get("email"))
             if email in existing_in_db:
                 self._mark_registered_email(
@@ -1432,22 +1723,130 @@ class LuckMailService(BaseEmailService):
                     },
                 )
                 continue
-            if probed_candidates >= probe_limit:
-                logger.info(
-                    f"LuckMail 复用邮箱候选已达到探测上限，优先检查前 {probed_candidates} 个可用候选"
-                )
+            probe_items.append((len(probe_items), info))
+
+        if not probe_items:
+            return []
+
+        if desired_count > 1 and int(self.config.get("batch_reuse_probe_workers") or 1) > 1:
+            return self._reserve_reusable_purchase_inboxes_parallel(
+                probe_items=probe_items,
+                desired_count=desired_count,
+                progress_callback=progress_callback,
+            )
+
+        probe_limit = max(
+            int(self.config.get("reuse_purchase_candidate_limit") or 3),
+            min(len(probe_items), desired_count * 2),
+        )
+        total_units = probe_limit
+        request_timeout_seconds = max(
+            int(self.config.get("batch_reuse_probe_request_timeout_seconds") or 2),
+            1,
+        )
+        allow_python_fallback = bool(self.config.get("batch_reuse_probe_allow_python_fallback", False))
+        prepared: List[Dict[str, Any]] = []
+        failed_count = 0
+        skipped_count = 0
+        transient_items: List[Dict[str, Any]] = []
+        if progress_callback:
+            progress_callback(
+                {
+                    "phase": "running",
+                    "mode": "sequential",
+                    "processed": 0,
+                    "total": probe_limit,
+                    "prepared": 0,
+                    "failed": 0,
+                    "skipped": 0,
+                    "workers": 1,
+                }
+            )
+        for idx, info in probe_items[:probe_limit]:
+            if len(prepared) >= desired_count:
                 break
-            if not self._claim_email(email, info):
-                logger.info(f"LuckMail 复用邮箱已被当前批次占用，跳过: {email}")
-                continue
-            probed_candidates += 1
-            if not self._ensure_purchase_inbox_ready(info):
-                reason = f"LuckMail 邮箱可用性检查失败: {email}"
-                self._record_unavailable_purchase(info, reason)
-                self._release_claimed_email(email)
-                logger.warning(f"LuckMail 复用邮箱探活未通过，已跳过: {email}")
-                continue
-            prepared.append(info)
+            status, ready_info = self._probe_reusable_purchase_candidate(
+                info,
+                request_timeout_seconds=request_timeout_seconds,
+                allow_python_fallback=allow_python_fallback,
+            )
+            if status == "ready" and ready_info:
+                prepared.append(ready_info)
+            elif status == "transient" and ready_info:
+                transient_items.append(ready_info)
+            elif status == "failed":
+                failed_count += 1
+            else:
+                skipped_count += 1
+            if progress_callback:
+                progress_callback(
+                    {
+                        "phase": "running",
+                        "mode": "sequential",
+                        "processed": min(idx + 1, probe_limit),
+                        "total": probe_limit,
+                        "prepared": len(prepared),
+                        "failed": failed_count,
+                        "skipped": skipped_count,
+                        "workers": 1,
+                    }
+                )
+        remaining_needed = max(desired_count - len(prepared), 0)
+        if remaining_needed > 0 and transient_items:
+            retry_timeout = max(
+                int(self.config.get("token_alive_request_timeout") or 4),
+                max(int(self.config.get("batch_reuse_probe_request_timeout_seconds") or 2), 1) * 3,
+            )
+            retry_limit = min(len(transient_items), max(remaining_needed * 2, remaining_needed))
+            total_units += retry_limit
+            logger.info(
+                "LuckMail 顺序预扫描对暂时失败候选发起二次探活: "
+                f"retry_limit={retry_limit}, retry_timeout={retry_timeout}s"
+            )
+            for retry_index, retry_info in enumerate(transient_items[:retry_limit], start=1):
+                if len(prepared) >= desired_count:
+                    break
+                status, ready_info = self._probe_reusable_purchase_candidate(
+                    retry_info,
+                    request_timeout_seconds=retry_timeout,
+                    allow_python_fallback=True,
+                )
+                if status == "ready" and ready_info:
+                    prepared.append(ready_info)
+                elif status == "failed":
+                    failed_count += 1
+                else:
+                    skipped_count += 1
+                if progress_callback:
+                    progress_callback(
+                        {
+                            "phase": "retrying",
+                            "mode": "sequential_retry",
+                            "processed": min(probe_limit + retry_index, total_units),
+                            "total": total_units,
+                            "prepared": len(prepared),
+                            "failed": failed_count,
+                            "skipped": skipped_count,
+                            "workers": 1,
+                        }
+                    )
+        if probe_limit < len(probe_items):
+            logger.info(
+                f"LuckMail 复用邮箱候选已达到探测上限，优先检查前 {probe_limit} 个可用候选"
+            )
+        if progress_callback:
+            progress_callback(
+                {
+                    "phase": "done",
+                    "mode": "sequential",
+                    "processed": min(total_units, max(probe_limit, len(prepared) + failed_count + skipped_count)),
+                    "total": total_units,
+                    "prepared": len(prepared),
+                    "failed": failed_count,
+                    "skipped": skipped_count,
+                    "workers": 1,
+                }
+            )
 
         return prepared
 
@@ -1458,6 +1857,7 @@ class LuckMailService(BaseEmailService):
         project_code: Optional[str] = None,
         email_type: Optional[str] = None,
         preferred_domain: Optional[str] = None,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> int:
         batch_key = _normalize_batch_key(batch_id)
         if not batch_key:
@@ -1472,6 +1872,7 @@ class LuckMailService(BaseEmailService):
             preferred_domain=str(preferred_domain or self.config.get("preferred_domain") or "").strip().lstrip("@"),
             target_count=max(int(target_count or 0), 0),
             log_when_empty=True,
+            progress_callback=progress_callback,
         )
 
         with _STATE_LOCK:

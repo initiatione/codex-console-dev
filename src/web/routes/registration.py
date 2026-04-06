@@ -6,6 +6,7 @@ import asyncio
 import logging
 import uuid
 import random
+import sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -55,11 +56,57 @@ router = APIRouter()
 running_tasks: dict = {}
 # 批量任务存储
 batch_tasks: Dict[str, dict] = {}
+_TERMINAL_PROGRESS_LOCK = threading.Lock()
+_TERMINAL_PROGRESS_FRAMES = "|/-\\"
 _OUTLOOK_ACCOUNT_CLAIM_LOCK = threading.RLock()
 _OUTLOOK_ACCOUNT_CLAIM_TTL_SECONDS = 30 * 60
 _OUTLOOK_ACCOUNT_CLAIMS: Dict[str, Dict[str, Any]] = {}
 RECOVERED_RUNNING_TASK_ERROR = '应用重启后检测到遗留运行任务，已自动标记失败'
 RECOVERED_PENDING_TASK_ERROR = '应用重启后检测到遗留排队任务，已自动标记取消'
+
+
+class _LuckMailPrepareTerminalProgress:
+    def __init__(self, batch_id: str, service_name: str):
+        self.batch_id = str(batch_id or "").strip()
+        self.service_name = str(service_name or "luckmail").strip() or "luckmail"
+        self.enabled = bool(getattr(sys.stdout, "isatty", None) and sys.stdout.isatty())
+        self._last_length = 0
+
+    def update(self, payload: Dict[str, Any]) -> None:
+        if not self.enabled:
+            return
+        total = max(int((payload or {}).get("total") or 0), 1)
+        processed = max(0, min(int((payload or {}).get("processed") or 0), total))
+        prepared = max(int((payload or {}).get("prepared") or 0), 0)
+        failed = max(int((payload or {}).get("failed") or 0), 0)
+        skipped = max(int((payload or {}).get("skipped") or 0), 0)
+        workers = max(int((payload or {}).get("workers") or 1), 1)
+        phase = str((payload or {}).get("phase") or "running").strip().lower()
+        frame = "OK" if phase == "done" else _TERMINAL_PROGRESS_FRAMES[processed % len(_TERMINAL_PROGRESS_FRAMES)]
+        bar_width = 24
+        filled = min(bar_width, int(bar_width * processed / total)) if total else bar_width
+        bar = "#" * filled + "." * (bar_width - filled)
+        line = (
+            f"[邮箱预热] {self.service_name} {frame} "
+            f"[{bar}] {processed}/{total} ready={prepared} failed={failed} skip={skipped} workers={workers}"
+        )
+        with _TERMINAL_PROGRESS_LOCK:
+            padding = max(self._last_length - len(line), 0)
+            sys.stdout.write("\r" + line + (" " * padding))
+            if phase == "done":
+                sys.stdout.write("\n")
+                self._last_length = 0
+            else:
+                self._last_length = len(line)
+            sys.stdout.flush()
+
+    def abort(self) -> None:
+        if not self.enabled or self._last_length <= 0:
+            return
+        with _TERMINAL_PROGRESS_LOCK:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            self._last_length = 0
 
 
 def _normalize_outlook_account_email(email: Optional[str]) -> str:
@@ -1322,7 +1369,17 @@ def _prepare_luckmail_batch_reuse_pool_sync(
     config = dict(config)
     config["batch_id"] = batch_id
     service = EmailServiceFactory.create(EmailServiceType.LUCKMAIL, config)
-    prepared_count = int(service.prepare_batch_reusable_inboxes(batch_id=batch_id, target_count=max(int(task_count or 0), 0)))
+    renderer = _LuckMailPrepareTerminalProgress(batch_id=batch_id, service_name=service_name)
+    try:
+        prepared_count = int(
+            service.prepare_batch_reusable_inboxes(
+                batch_id=batch_id,
+                target_count=max(int(task_count or 0), 0),
+                progress_callback=renderer.update,
+            )
+        )
+    finally:
+        renderer.abort()
     return {
         "applicable": True,
         "prepared_count": prepared_count,
@@ -1331,6 +1388,10 @@ def _prepare_luckmail_batch_reuse_pool_sync(
         "service_name": service_name,
         "scan_pages": int(config.get("purchase_scan_pages") or 5),
         "scan_page_size": int(config.get("purchase_scan_page_size") or 100),
+        "probe_workers": int(config.get("batch_reuse_probe_workers") or 8),
+        "probe_limit": int(config.get("batch_reuse_probe_limit") or 24),
+        "probe_request_timeout_seconds": int(config.get("batch_reuse_probe_request_timeout_seconds") or 2),
+        "probe_python_fallback": bool(config.get("batch_reuse_probe_allow_python_fallback", False)),
     }
 
 
@@ -1370,7 +1431,10 @@ async def _prepare_luckmail_batch_reuse_pool(
     add_batch_log(
         "[邮箱预热] LuckMail 批量预扫描完成: "
         f"service={result.get('service_name') or 'luckmail'}, prepared={result.get('prepared_count', 0)}/{result.get('requested_count', 0)}, "
-        f"scan_pages={result.get('scan_pages', 0)}, page_size={result.get('scan_page_size', 0)}"
+        f"scan_pages={result.get('scan_pages', 0)}, page_size={result.get('scan_page_size', 0)}, "
+        f"probe_workers={result.get('probe_workers', 0)}, probe_limit={result.get('probe_limit', 0)}, "
+        f"probe_timeout={result.get('probe_request_timeout_seconds', 0)}s, "
+        f"probe_python_fallback={str(bool(result.get('probe_python_fallback', False))).lower()}"
     )
     if int(result.get("prepared_count") or 0) <= 0:
         add_batch_log("[邮箱预热] 当前没有可复用邮箱，后续任务将直接尝试新购/建单")

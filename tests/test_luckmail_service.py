@@ -2,6 +2,8 @@ import logging
 import pytest
 import importlib.util
 import sys
+import threading
+import time
 import types
 from pathlib import Path
 from types import SimpleNamespace
@@ -143,6 +145,7 @@ def build_service(monkeypatch, user, config=None, python_client_cls=FakeClient, 
     monkeypatch.setattr(luckmail_module, "_NO_STOCK_BREAKERS", {})
     monkeypatch.setattr(luckmail_module, "_BATCH_REUSE_POOLS", {})
     monkeypatch.setattr(luckmail_module, "_BATCH_REUSE_PREPARED", set())
+    monkeypatch.setattr(luckmail_module, "_INFLIGHT_EMAILS", {})
     monkeypatch.setattr(
         luckmail_module,
         "resolve_luckmail_rust_cli_path",
@@ -178,6 +181,10 @@ def test_luckmail_defaults_use_wider_purchase_prescan_window(monkeypatch):
 
     assert service.config["purchase_scan_pages"] == 5
     assert service.config["purchase_scan_page_size"] == 100
+    assert service.config["batch_reuse_probe_workers"] == 8
+    assert service.config["batch_reuse_probe_limit"] == 24
+    assert service.config["batch_reuse_probe_request_timeout_seconds"] == 2
+    assert service.config["batch_reuse_probe_allow_python_fallback"] is False
 
 
 def test_create_email_skips_reused_purchase_that_fails_alive(monkeypatch):
@@ -473,6 +480,30 @@ def test_backend_check_token_alive_passes_request_timeout_to_rust_cli(monkeypatc
     assert user.calls == []
 
 
+def test_backend_check_token_alive_can_skip_python_fallback(monkeypatch):
+    user = FakeUser()
+
+    def fake_check_token_alive(self, token, timeout_seconds=None):
+        raise rust_cli_module.LuckMailRustCliError("rust timeout")
+
+    monkeypatch.setattr(rust_cli_module.LuckMailRustCliBackend, "check_token_alive", fake_check_token_alive)
+    service = build_service(
+        monkeypatch,
+        user,
+        config={"sdk_preference": "rust"},
+        rust_cli_path="d:/codex-console-test/fake-luckmail-cli.exe",
+    )
+
+    with pytest.raises(rust_cli_module.LuckMailRustCliError, match="rust timeout"):
+        service._backend_check_token_alive(
+            "tok-fast",
+            request_timeout_seconds=2,
+            allow_python_fallback=False,
+        )
+
+    assert user.calls == []
+
+
 def test_pick_reusable_purchase_inbox_limits_alive_candidates(monkeypatch):
     user = FakeUser()
     user.purchase_pages = [[
@@ -575,6 +606,101 @@ def test_prepare_batch_reusable_inboxes_prefills_pool_and_create_email_consumes_
     assert get_purchase_calls == [("get_purchases", 1, 100, 0)]
     alive_calls = [call for call in user.calls if call[0] == "check_token_alive"]
     assert [call[1] for call in alive_calls] == ["tok-first", "tok-second"]
+
+
+def test_prepare_batch_reusable_inboxes_probes_candidates_concurrently(monkeypatch):
+    user = FakeUser()
+    user.purchase_pages = [[
+        {"id": 101, "email_address": "first@example.com", "token": "tok-first"},
+        {"id": 102, "email_address": "second@example.com", "token": "tok-second"},
+        {"id": 103, "email_address": "third@example.com", "token": "tok-third"},
+        {"id": 104, "email_address": "fourth@example.com", "token": "tok-fourth"},
+        {"id": 105, "email_address": "fifth@example.com", "token": "tok-fifth"},
+    ]]
+
+    service = build_service(
+        monkeypatch,
+        user,
+        config={
+            "batch_reuse_probe_workers": 3,
+            "batch_reuse_probe_limit": 4,
+            "batch_reuse_probe_request_timeout_seconds": 2,
+        },
+    )
+
+    gate = threading.Event()
+    state = {
+        "active": 0,
+        "max_active": 0,
+        "timeouts": [],
+        "progress": [],
+    }
+    lock = threading.Lock()
+
+    def fake_ready(order_info, request_timeout_seconds=None, allow_python_fallback=True):
+        with lock:
+            state["active"] += 1
+            state["max_active"] = max(state["max_active"], state["active"])
+            state["timeouts"].append(request_timeout_seconds)
+            if state["active"] >= 2:
+                gate.set()
+        gate.wait(timeout=0.5)
+        time.sleep(0.02)
+        with lock:
+            state["active"] -= 1
+        order_info["alive_checked_at"] = "2026-04-07T00:00:00+00:00"
+        return True
+
+    monkeypatch.setattr(service, "_ensure_purchase_inbox_ready", fake_ready)
+
+    prepared_count = service.prepare_batch_reusable_inboxes(
+        "batch-concurrent",
+        10,
+        progress_callback=lambda payload: state["progress"].append(dict(payload)),
+    )
+
+    assert prepared_count == 4
+    assert state["max_active"] >= 2
+    assert state["timeouts"] == [2, 2, 2, 2]
+    assert state["progress"][0]["processed"] == 0
+    assert state["progress"][-1]["phase"] == "done"
+    assert state["progress"][-1]["prepared"] == 4
+
+
+def test_prepare_batch_reusable_inboxes_retries_transient_candidates_without_blacklisting(monkeypatch):
+    user = FakeUser()
+    user.purchase_pages = [[
+        {"id": 201, "email_address": "transient@example.com", "token": "tok-transient"},
+    ]]
+
+    service = build_service(
+        monkeypatch,
+        user,
+        config={
+            "batch_reuse_probe_workers": 2,
+            "batch_reuse_probe_limit": 4,
+            "batch_reuse_probe_request_timeout_seconds": 2,
+        },
+    )
+
+    calls = []
+
+    def fake_ready(order_info, request_timeout_seconds=None, allow_python_fallback=True):
+        calls.append((request_timeout_seconds, allow_python_fallback))
+        if len(calls) == 1:
+            order_info["_alive_failure_kind"] = "transient"
+            order_info["_alive_failure_detail"] = "timeout"
+            return False
+        order_info["alive_checked_at"] = "2026-04-07T00:00:00+00:00"
+        return True
+
+    monkeypatch.setattr(service, "_ensure_purchase_inbox_ready", fake_ready)
+
+    prepared_count = service.prepare_batch_reusable_inboxes("batch-transient", 1)
+
+    assert prepared_count == 1
+    assert calls == [(2, False), (6, True)]
+    assert service._index_store["failed"] == {}
 
 
 def test_create_email_skips_rescan_when_batch_reuse_pool_is_prepared_but_empty(monkeypatch):

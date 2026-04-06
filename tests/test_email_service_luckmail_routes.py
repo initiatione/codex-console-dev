@@ -125,6 +125,10 @@ def test_email_service_types_include_luckmail_compat_fields():
     assert "reuse_existing_purchases" in field_names
     assert "purchase_scan_pages" in field_names
     assert "purchase_scan_page_size" in field_names
+    assert "batch_reuse_probe_workers" in field_names
+    assert "batch_reuse_probe_limit" in field_names
+    assert "batch_reuse_probe_request_timeout_seconds" in field_names
+    assert "batch_reuse_probe_allow_python_fallback" in field_names
     assert "ensure_purchase_ready" in field_names
     assert "reuse_purchase_candidate_limit" in field_names
     assert "token_alive_timeout" in field_names
@@ -145,6 +149,10 @@ def test_normalize_email_service_config_coerces_luckmail_values():
             "reuse_existing_purchases": "false",
             "purchase_scan_pages": "8",
             "purchase_scan_page_size": "120",
+            "batch_reuse_probe_workers": "10",
+            "batch_reuse_probe_limit": "30",
+            "batch_reuse_probe_request_timeout_seconds": "3",
+            "batch_reuse_probe_allow_python_fallback": "true",
             "ensure_purchase_ready": "true",
             "reuse_purchase_candidate_limit": "2",
             "token_alive_timeout": "15",
@@ -162,6 +170,10 @@ def test_normalize_email_service_config_coerces_luckmail_values():
     assert normalized["reuse_existing_purchases"] is False
     assert normalized["purchase_scan_pages"] == 8
     assert normalized["purchase_scan_page_size"] == 120
+    assert normalized["batch_reuse_probe_workers"] == 10
+    assert normalized["batch_reuse_probe_limit"] == 30
+    assert normalized["batch_reuse_probe_request_timeout_seconds"] == 3
+    assert normalized["batch_reuse_probe_allow_python_fallback"] is True
     assert normalized["ensure_purchase_ready"] is True
     assert normalized["reuse_purchase_candidate_limit"] == 2
     assert normalized["token_alive_timeout"] == 15
