@@ -58,6 +58,7 @@ class EmailServiceType(str, Enum):
     MOE_MAIL = "moe_mail"
     TEMP_MAIL = "temp_mail"
     DUCK_MAIL = "duck_mail"
+    DUCKDUCKGO_CLOUDMAIL = "duckduckgo_cloudmail"
     LUCKMAIL = "luckmail"
     FREEMAIL = "freemail"
     IMAP_MAIL = "imap_mail"
@@ -199,6 +200,20 @@ EMAIL_SERVICE_DEFAULTS = {
         "password_length": 12,
         "timeout": 30,
         "max_retries": 3,
+    },
+    "duckduckgo_cloudmail": {
+        "bridge_base_url": "",
+        "bridge_token": "",
+        "forward_to_email": "",
+        "cloudmail_service_id": 0,
+        "cloudmail_base_url": "",
+        "cloudmail_admin_email": "",
+        "cloudmail_admin_password": "",
+        "timeout": 30,
+        "max_retries": 3,
+        "lease_ttl_sec": 900,
+        "pool_target_size": 50,
+        "low_watermark": 10,
     },
     "freemail": {
         "base_url": "",

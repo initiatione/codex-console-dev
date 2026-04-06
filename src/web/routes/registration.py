@@ -36,6 +36,10 @@ from ...core.register import (
     build_token_completeness_metadata,
 )
 from ...services import EmailServiceFactory, EmailServiceType
+from ...services.duckduckgo_cloudmail import (
+    build_duckduckgo_cloudmail_runtime_config,
+    normalize_duckduckgo_cloudmail_config,
+)
 from ...config.settings import get_settings, Settings
 from ...core.auto_registration import (
     add_auto_registration_log,
@@ -541,6 +545,8 @@ def _normalize_email_service_config(
     elif service_type == EmailServiceType.DUCK_MAIL:
         if 'domain' in normalized and 'default_domain' not in normalized:
             normalized['default_domain'] = normalized.pop('domain')
+    elif service_type == EmailServiceType.DUCKDUCKGO_CLOUDMAIL:
+        normalized = build_duckduckgo_cloudmail_runtime_config(normalized, proxy_url=proxy_url)
     elif service_type == EmailServiceType.LUCKMAIL:
         if 'domain' in normalized and 'preferred_domain' not in normalized:
             normalized['preferred_domain'] = normalized.pop('domain')
@@ -549,6 +555,35 @@ def _normalize_email_service_config(
         normalized['proxy_url'] = proxy_url
 
     return normalized
+
+
+def _load_linked_cloudmail_service_config(db, config: Optional[dict]) -> Optional[Dict[str, Any]]:
+    normalized = normalize_duckduckgo_cloudmail_config(config)
+    service_id = int(normalized.get("cloudmail_service_id") or 0)
+    if service_id <= 0:
+        return None
+
+    from ...database.models import EmailService as EmailServiceModel
+
+    db_service = db.query(EmailServiceModel).filter(
+        EmailServiceModel.id == service_id,
+        EmailServiceModel.enabled == True,
+    ).first()
+    if not db_service:
+        raise ValueError(f"关联的 CloudMail 服务不存在或未启用: {service_id}")
+    if str(db_service.service_type or "") != EmailServiceType.CLOUDMAIL.value:
+        raise ValueError(f"邮箱服务 {service_id} 不是 CloudMail 类型")
+    return _normalize_email_service_config(EmailServiceType.CLOUDMAIL, db_service.config)
+
+
+def _resolve_duckduckgo_cloudmail_config(db, config: Optional[dict], proxy_url: Optional[str]) -> dict:
+    normalized = _normalize_email_service_config(EmailServiceType.DUCKDUCKGO_CLOUDMAIL, config, proxy_url)
+    linked_cloudmail_config = _load_linked_cloudmail_service_config(db, normalized)
+    return build_duckduckgo_cloudmail_runtime_config(
+        normalized,
+        linked_cloudmail_config=linked_cloudmail_config,
+        proxy_url=proxy_url,
+    )
 
 
 def _build_empty_token_profile_stats() -> Dict[str, int]:
@@ -806,6 +841,23 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                         logger.info(f"使用数据库 DuckMail 服务: {db_service.name}")
                     else:
                         raise ValueError("没有可用的 DuckMail 邮箱服务，请先在邮箱服务页面添加服务")
+                elif service_type == EmailServiceType.DUCKDUCKGO_CLOUDMAIL:
+                    from ...database.models import EmailService as EmailServiceModel
+
+                    db_service = db.query(EmailServiceModel).filter(
+                        EmailServiceModel.service_type == "duckduckgo_cloudmail",
+                        EmailServiceModel.enabled == True
+                    ).order_by(EmailServiceModel.priority.asc()).first()
+
+                    if db_service and db_service.config:
+                        config = _resolve_duckduckgo_cloudmail_config(db, db_service.config, actual_proxy_url)
+                        crud.update_registration_task(db, task_uuid, email_service_id=db_service.id)
+                        logger.info(f"使用数据库 DuckDuckGo-CloudMail 服务: {db_service.name}")
+                    else:
+                        config = _resolve_duckduckgo_cloudmail_config(db, email_service_config or {}, actual_proxy_url)
+                        missing_keys = [key for key in ("bridge_base_url", "forward_to_email") if not config.get(key)]
+                        if missing_keys:
+                            raise ValueError("没有可用的 DuckDuckGo-CloudMail 服务，请先在邮箱服务页面添加服务")
                 elif service_type == EmailServiceType.FREEMAIL:
                     from ...database.models import EmailService as EmailServiceModel
 
@@ -2407,16 +2459,19 @@ async def get_available_email_services():
     from ...config.settings import get_settings
 
     settings = get_settings()
+    tempmail_enabled = bool(getattr(settings, "tempmail_enabled", False))
+    yyds_mail_enabled = bool(getattr(settings, "yyds_mail_enabled", False))
+    yyds_mail_api_key = getattr(settings, "yyds_mail_api_key", None)
     result = {
         "tempmail": {
-            "available": bool(settings.tempmail_enabled),
-            "count": 1 if settings.tempmail_enabled else 0,
+            "available": tempmail_enabled,
+            "count": 1 if tempmail_enabled else 0,
             "services": ([{
                 "id": None,
                 "name": "Tempmail.lol",
                 "type": "tempmail",
                 "description": "临时邮箱，自动创建"
-            }] if settings.tempmail_enabled else [])
+            }] if tempmail_enabled else [])
         },
         "yyds_mail": {
             "available": False,
@@ -2448,6 +2503,11 @@ async def get_available_email_services():
             "count": 0,
             "services": []
         },
+        "duckduckgo_cloudmail": {
+            "available": False,
+            "count": 0,
+            "services": []
+        },
         "freemail": {
             "available": False,
             "count": 0,
@@ -2465,15 +2525,15 @@ async def get_available_email_services():
         }
     }
 
-    yyds_api_key = settings.yyds_mail_api_key.get_secret_value() if settings.yyds_mail_api_key else ""
-    if settings.yyds_mail_enabled and yyds_api_key:
+    yyds_api_key = yyds_mail_api_key.get_secret_value() if yyds_mail_api_key else ""
+    if yyds_mail_enabled and yyds_api_key:
         result["yyds_mail"]["available"] = True
         result["yyds_mail"]["count"] = 1
         result["yyds_mail"]["services"].append({
             "id": None,
             "name": "YYDS Mail",
             "type": "yyds_mail",
-            "default_domain": settings.yyds_mail_default_domain or None,
+            "default_domain": getattr(settings, "yyds_mail_default_domain", None) or None,
             "description": "YYDS Mail API 临时邮箱",
         })
 
@@ -2600,6 +2660,25 @@ async def get_available_email_services():
 
         result["duck_mail"]["count"] = len(duck_mail_services)
         result["duck_mail"]["available"] = len(duck_mail_services) > 0
+
+        duckduckgo_cloudmail_services = db.query(EmailServiceModel).filter(
+            EmailServiceModel.service_type == "duckduckgo_cloudmail",
+            EmailServiceModel.enabled == True
+        ).order_by(EmailServiceModel.priority.asc()).all()
+
+        for service in duckduckgo_cloudmail_services:
+            config = service.config or {}
+            result["duckduckgo_cloudmail"]["services"].append({
+                "id": service.id,
+                "name": service.name,
+                "type": "duckduckgo_cloudmail",
+                "forward_to_email": config.get("forward_to_email"),
+                "cloudmail_service_id": config.get("cloudmail_service_id"),
+                "priority": service.priority
+            })
+
+        result["duckduckgo_cloudmail"]["count"] = len(duckduckgo_cloudmail_services)
+        result["duckduckgo_cloudmail"]["available"] = len(duckduckgo_cloudmail_services) > 0
 
         freemail_services = db.query(EmailServiceModel).filter(
             EmailServiceModel.service_type == "freemail",

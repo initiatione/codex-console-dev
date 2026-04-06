@@ -16,6 +16,7 @@ from .outlook import OutlookService
 from .moe_mail import MeoMailEmailService
 from .temp_mail import TempMailService
 from .duck_mail import DuckMailService
+from .duckduckgo_cloudmail import DuckDuckGoCloudMailService
 from .luckmail_mail import LuckMailService
 from .freemail import FreemailService
 from .imap_mail import ImapMailService
@@ -28,6 +29,7 @@ EmailServiceFactory.register(EmailServiceType.OUTLOOK, OutlookService)
 EmailServiceFactory.register(EmailServiceType.MOE_MAIL, MeoMailEmailService)
 EmailServiceFactory.register(EmailServiceType.TEMP_MAIL, TempMailService)
 EmailServiceFactory.register(EmailServiceType.DUCK_MAIL, DuckMailService)
+EmailServiceFactory.register(EmailServiceType.DUCKDUCKGO_CLOUDMAIL, DuckDuckGoCloudMailService)
 EmailServiceFactory.register(EmailServiceType.LUCKMAIL, LuckMailService)
 EmailServiceFactory.register(EmailServiceType.FREEMAIL, FreemailService)
 EmailServiceFactory.register(EmailServiceType.IMAP_MAIL, ImapMailService)
@@ -64,6 +66,7 @@ __all__ = [
     'MeoMailEmailService',
     'TempMailService',
     'DuckMailService',
+    'DuckDuckGoCloudMailService',
     'LuckMailService',
     'FreemailService',
     'ImapMailService',

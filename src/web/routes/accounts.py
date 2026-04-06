@@ -2544,6 +2544,10 @@ def _build_inbox_config(db, service_type, email: str) -> dict:
     """根据账号邮箱服务类型从数据库构建服务配置（不传 proxy_url）"""
     from ...database.models import EmailService as EmailServiceModel
     from ...services import EmailServiceType as EST
+    from ...services.duckduckgo_cloudmail import (
+        build_duckduckgo_cloudmail_runtime_config,
+        normalize_duckduckgo_cloudmail_config,
+    )
 
     if service_type == EST.TEMPMAIL:
         settings = get_settings()
@@ -2589,6 +2593,7 @@ def _build_inbox_config(db, service_type, email: str) -> dict:
     type_map = {
         EST.TEMP_MAIL: "temp_mail",
         EST.DUCK_MAIL: "duck_mail",
+        EST.DUCKDUCKGO_CLOUDMAIL: "duckduckgo_cloudmail",
         EST.FREEMAIL: "freemail",
         EST.IMAP_MAIL: "imap_mail",
         EST.OUTLOOK: "outlook",
@@ -2612,6 +2617,18 @@ def _build_inbox_config(db, service_type, email: str) -> dict:
     if not svc:
         return None
     cfg = svc.config.copy() if svc.config else {}
+    if service_type == EST.DUCKDUCKGO_CLOUDMAIL:
+        normalized_cfg = normalize_duckduckgo_cloudmail_config(cfg)
+        linked_cloudmail_config = None
+        linked_service_id = int(normalized_cfg.get("cloudmail_service_id") or 0)
+        if linked_service_id > 0:
+            linked_service = db.query(EmailServiceModel).filter(
+                EmailServiceModel.id == linked_service_id,
+                EmailServiceModel.enabled == True,
+            ).first()
+            if linked_service and str(linked_service.service_type or "") == EST.CLOUDMAIL.value:
+                linked_cloudmail_config = linked_service.config or {}
+        return build_duckduckgo_cloudmail_runtime_config(normalized_cfg, linked_cloudmail_config=linked_cloudmail_config)
     if "api_url" in cfg and "base_url" not in cfg:
         cfg["base_url"] = cfg.pop("api_url")
     return cfg

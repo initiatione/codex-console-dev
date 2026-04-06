@@ -17,6 +17,10 @@ from ...database.models import Account as AccountModel
 from ...database.models import RegistrationTask as RegistrationTaskModel
 from ...config.settings import get_settings
 from ...services import EmailServiceFactory, EmailServiceType
+from ...services.duckduckgo_cloudmail import (
+    build_duckduckgo_cloudmail_runtime_config,
+    normalize_duckduckgo_cloudmail_config,
+)
 from ..task_manager import task_manager
 
 logger = logging.getLogger(__name__)
@@ -99,6 +103,8 @@ SENSITIVE_FIELDS = {
     'admin_token',
     'admin_password',
     'custom_auth',
+    'bridge_token',
+    'cloudmail_admin_password',
 }
 
 
@@ -145,6 +151,9 @@ def normalize_email_service_config(service_type: str, config: Optional[Dict[str,
     if service_type == "cloudmail" and normalized.get("api_key") and not normalized.get("admin_password"):
         normalized["admin_password"] = normalized.pop("api_key")
 
+    if service_type == "duckduckgo_cloudmail":
+        return normalize_duckduckgo_cloudmail_config(normalized)
+
     if service_type == "luckmail":
         for key in ("project_code", "email_type", "preferred_domain", "sdk_preference", "inbox_mode", "rust_cli_path"):
             if key in normalized and normalized.get(key) is not None:
@@ -172,6 +181,30 @@ def normalize_email_service_config(service_type: str, config: Optional[Dict[str,
             if key in normalized:
                 normalized[key] = _coerce_config_float(normalized.get(key))
 
+    return normalized
+
+
+def _load_linked_cloudmail_service_config(db, config: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    normalized = normalize_duckduckgo_cloudmail_config(config)
+    service_id = int(normalized.get("cloudmail_service_id") or 0)
+    if service_id <= 0:
+        return None
+
+    service = db.query(EmailServiceModel).filter(EmailServiceModel.id == service_id).first()
+    if not service:
+        raise ValueError(f"关联的 CloudMail 服务不存在: {service_id}")
+    if str(service.service_type or "") != "cloudmail":
+        raise ValueError(f"邮箱服务 {service_id} 不是 CloudMail 类型")
+    if not service.enabled:
+        raise ValueError(f"关联的 CloudMail 服务未启用: {service_id}")
+    return normalize_email_service_config("cloudmail", service.config)
+
+
+def resolve_runtime_email_service_config(db, service_type: str, config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    normalized = normalize_email_service_config(service_type, config)
+    if service_type == "duckduckgo_cloudmail":
+        linked_cloudmail_config = _load_linked_cloudmail_service_config(db, normalized)
+        return build_duckduckgo_cloudmail_runtime_config(normalized, linked_cloudmail_config=linked_cloudmail_config)
     return normalized
 
 
@@ -298,6 +331,7 @@ async def get_email_services_stats():
             'freemail_count': 0,
             'imap_mail_count': 0,
             'cloudmail_count': 0,
+            'duckduckgo_cloudmail_count': 0,
             'luckmail_count': 0,
             'tempmail_available': tempmail_enabled or yyds_enabled,
             'yyds_mail_available': yyds_enabled,
@@ -323,6 +357,8 @@ async def get_email_services_stats():
                 stats['imap_mail_count'] = count
             elif service_type == 'cloudmail':
                 stats['cloudmail_count'] = count
+            elif service_type == 'duckduckgo_cloudmail':
+                stats['duckduckgo_cloudmail_count'] = count
             elif service_type == 'luckmail':
                 stats['luckmail_count'] = count
 
@@ -396,6 +432,22 @@ async def get_service_types():
                     {"name": "default_domain", "label": "默认域名", "required": True, "placeholder": "duckmail.sbs"},
                     {"name": "api_key", "label": "API Key", "required": False, "secret": True},
                     {"name": "password_length", "label": "随机密码长度", "required": False, "default": 12},
+                ]
+            },
+            {
+                "value": "duckduckgo_cloudmail",
+                "label": "DuckDuckGo-CloudMail",
+                "description": "通过 duckduckgogo bridge 领取 Duck alias，并用 CloudMail 精确匹配验证码",
+                "config_fields": [
+                    {"name": "bridge_base_url", "label": "Bridge 地址", "required": True, "placeholder": "http://127.0.0.1:1456"},
+                    {"name": "bridge_token", "label": "Bridge Token", "required": False, "secret": True},
+                    {"name": "forward_to_email", "label": "CloudMail 收件箱", "required": True, "placeholder": "test@example.com"},
+                    {"name": "cloudmail_service_id", "label": "关联 CloudMail 服务 ID", "required": False, "type": "number"},
+                    {"name": "cloudmail_base_url", "label": "CloudMail API 地址", "required": False, "placeholder": "https://cloudmail.example.com"},
+                    {"name": "cloudmail_admin_email", "label": "CloudMail 管理邮箱", "required": False, "placeholder": "admin@example.com"},
+                    {"name": "cloudmail_admin_password", "label": "CloudMail 管理密码", "required": False, "secret": True},
+                    {"name": "lease_ttl_sec", "label": "租约 TTL(秒)", "required": False, "default": 900, "type": "number"},
+                    {"name": "timeout", "label": "超时时间", "required": False, "default": 30},
                 ]
             },
             {
@@ -526,6 +578,11 @@ async def create_email_service(request: EmailServiceCreate):
 
     with get_db() as db:
         normalized_config = normalize_email_service_config(request.service_type, request.config)
+        if request.service_type == "duckduckgo_cloudmail":
+            try:
+                _load_linked_cloudmail_service_config(db, normalized_config)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
         normalized_name = str(request.name or "").strip()
         if request.service_type == "outlook":
             normalized_name = str(normalized_config.get("email") or normalized_name).strip().lower()
@@ -574,7 +631,13 @@ async def update_email_service(service_id: int, request: EmailServiceUpdate):
             merged_config = {**current_config, **request.config}
             # 移除空值
             merged_config = {k: v for k, v in merged_config.items() if v}
-            update_data["config"] = normalize_email_service_config(service.service_type, merged_config)
+            normalized_merged_config = normalize_email_service_config(service.service_type, merged_config)
+            if service.service_type == "duckduckgo_cloudmail":
+                try:
+                    _load_linked_cloudmail_service_config(db, normalized_merged_config)
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+            update_data["config"] = normalized_merged_config
         if request.enabled is not None:
             update_data["enabled"] = request.enabled
         if request.priority is not None:
@@ -699,7 +762,7 @@ async def test_email_service(service_id: int):
             service_type = EmailServiceType(service.service_type)
             email_service = EmailServiceFactory.create(
                 service_type,
-                normalize_email_service_config(service.service_type, service.config),
+                resolve_runtime_email_service_config(db, service.service_type, service.config),
                 name=service.name,
             )
 
