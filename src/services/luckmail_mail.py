@@ -16,6 +16,13 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from .base import BaseEmailService, EmailServiceError, EmailServiceType
 from ..config.constants import OTP_CODE_PATTERN
+from .luckmail_appeal import (
+    build_failure_appeal_description,
+    build_failure_cause_hint,
+    is_auto_appeal_enabled,
+    map_failure_reason_to_appeal_reason,
+    submit_luckmail_appeal,
+)
 from .luckmail_rust_cli import LuckMailRustCliBackend, resolve_luckmail_rust_cli_path
 
 
@@ -28,9 +35,6 @@ _BATCH_REUSE_PREPARED: Set[str] = set()
 _BATCH_PURCHASE_GATES: Dict[str, threading.Lock] = {}
 _BATCH_PURCHASE_NEXT_ALLOWED_AT: Dict[str, float] = {}
 _NO_STOCK_BREAKERS: Dict[str, Dict[str, Any]] = {}
-# 申诉硬编码开关（临时）：False=关闭申诉提交；True=开启申诉提交。
-LUCKMAIL_APPEAL_ENABLED = False
-
 
 def _clear_luckmail_modules() -> None:
     stale_names = [name for name in list(sys.modules.keys()) if name == "luckmail" or name.startswith("luckmail.")]
@@ -187,6 +191,8 @@ class LuckMailService(BaseEmailService):
             "no_stock_shutdown_exit_delay_seconds": 0.5,
             # 当 token code 接口没有返回验证码时，退回邮件列表/详情接口再读一次。
             "token_mail_fallback": True,
+            "auto_submit_appeal_on_failure": True,
+            "appeal_timeout_seconds": 15,
             "timeout": 30,
             "max_retries": 3,
             "poll_interval": 3.0,
@@ -244,6 +250,11 @@ class LuckMailService(BaseEmailService):
             0.0,
         )
         self.config["token_mail_fallback"] = _coerce_bool(self.config.get("token_mail_fallback", True), True)
+        self.config["auto_submit_appeal_on_failure"] = _coerce_bool(
+            self.config.get("auto_submit_appeal_on_failure", True),
+            True,
+        )
+        self.config["appeal_timeout_seconds"] = max(int(self.config.get("appeal_timeout_seconds") or 15), 1)
         self.config["poll_interval"] = float(self.config.get("poll_interval") or 3.0)
         self.config["code_reuse_ttl"] = int(self.config.get("code_reuse_ttl") or 600)
         self.config["batch_purchase_min_interval_seconds"] = max(float(self.config.get("batch_purchase_min_interval_seconds") or 1.0), 0.0)
@@ -1220,6 +1231,8 @@ class LuckMailService(BaseEmailService):
         order_no_text = str(order_no or "").strip()
         if not order_no_text:
             return None
+        if self.client is None:
+            return None
         try:
             for page in range(1, max_pages + 1):
                 result = self.client.user.get_orders(page=page, page_size=page_size)
@@ -1249,7 +1262,6 @@ class LuckMailService(BaseEmailService):
         context: Dict[str, Any],
     ) -> Optional[Dict[str, Any]]:
         reason_text = str(reason or "").strip()
-        reason_lower = reason_text.lower()
 
         purchase_id_raw = context.get("purchase_id")
         order_id_raw = context.get("order_id")
@@ -1281,16 +1293,8 @@ class LuckMailService(BaseEmailService):
         if appeal_type is None:
             return None
 
-        if "429" in reason_lower or "limit" in reason_lower or "限流" in reason_text:
-            appeal_reason = "no_code"
-        elif "exists" in reason_lower or "already" in reason_lower or "已存在" in reason_text:
-            appeal_reason = "email_invalid"
-        elif "验证码" in reason_text or "otp" in reason_lower:
-            appeal_reason = "wrong_code"
-        else:
-            appeal_reason = "no_code"
-
-        desc = reason_text or "注册任务失败，申请人工核查并处理。"
+        appeal_reason = map_failure_reason_to_appeal_reason(reason_text)
+        desc = build_failure_appeal_description(reason_text)
         payload: Dict[str, Any] = {
             "appeal_type": appeal_type,
             "reason": appeal_reason,
@@ -1309,7 +1313,7 @@ class LuckMailService(BaseEmailService):
         context: Dict[str, Any],
         failed_record: Optional[Dict[str, Any]] = None,
     ) -> None:
-        if not LUCKMAIL_APPEAL_ENABLED:
+        if not is_auto_appeal_enabled(self.config):
             return
 
         reason_text = str(reason or "").strip()
@@ -1317,19 +1321,7 @@ class LuckMailService(BaseEmailService):
             return
 
         reason_lower = reason_text.lower()
-        should_appeal = (
-            "429" in reason_lower
-            or "限流" in reason_text
-            or "验证码" in reason_text
-            or "otp" in reason_lower
-            or "failed to register username" in reason_lower
-            or "用户名注册失败" in reason_text
-            or "创建用户账户失败" in reason_text
-            or "该邮箱已存在 openai" in reason_lower
-            or "user_already_exists" in reason_lower
-            or "already exists" in reason_lower
-        )
-        if not should_appeal:
+        if "任务已取消" in reason_text or "cancelled" in reason_lower or "canceled" in reason_lower:
             return
 
         email_norm = self._normalize_email(email)
@@ -1350,23 +1342,48 @@ class LuckMailService(BaseEmailService):
         if not payload:
             return
 
+        failure_hint = build_failure_cause_hint(reason_text)
+        appeal_reason = str(payload.get("reason") or "").strip() or "no_receive"
+        appeal_description = str(payload.get("description") or "").strip()
+        current["appeal_reason"] = appeal_reason
+        current["appeal_description"] = appeal_description
+        current["failure_hint"] = failure_hint
+
         try:
-            response = self.client.user.create_appeal(**payload)
-            appeal_no = str(self._extract_field(response, "appeal_no") or "").strip()
+            response = submit_luckmail_appeal(
+                self.config,
+                payload,
+                timeout_seconds=int(self.config.get("appeal_timeout_seconds") or 15),
+            )
+            appeal_no = str((response or {}).get("appeal_no") or "").strip()
             current["appeal_status"] = "submitted"
             current["appeal_at"] = self._now_iso()
             if appeal_no:
                 current["appeal_no"] = appeal_no
             failed_index[email_norm] = current
             self._save_email_index(self._failed_file, failed_index)
-            logger.info(f"LuckMail 已提交申诉: email={email_norm}, appeal_no={appeal_no or '-'}")
+            logger.info(
+                "LuckMail 注册失败自动申诉已提交: email=%s, probable_cause=%s, appeal_reason=%s, appeal_description=%s, appeal_no=%s",
+                email_norm,
+                failure_hint,
+                appeal_reason,
+                appeal_description,
+                appeal_no or "-",
+            )
         except Exception as exc:
             current["appeal_status"] = "failed"
             current["appeal_error"] = str(exc)[:500]
             current["appeal_at"] = self._now_iso()
             failed_index[email_norm] = current
             self._save_email_index(self._failed_file, failed_index)
-            logger.warning(f"LuckMail 提交申诉失败: email={email_norm}, error={exc}")
+            logger.warning(
+                "LuckMail 注册失败自动申诉提交失败: email=%s, probable_cause=%s, appeal_reason=%s, appeal_description=%s, error=%s",
+                email_norm,
+                failure_hint,
+                appeal_reason,
+                appeal_description,
+                exc,
+            )
 
     def _query_existing_account_emails(self, emails: Set[str]) -> Set[str]:
         if not emails:
@@ -2387,4 +2404,5 @@ class LuckMailService(BaseEmailService):
             "cached_orders": len(self._orders_by_no),
             "status": self.status.value,
         }
+
 

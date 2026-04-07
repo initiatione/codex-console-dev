@@ -185,7 +185,118 @@ def test_luckmail_defaults_use_wider_purchase_prescan_window(monkeypatch):
     assert service.config["batch_reuse_probe_limit"] == 24
     assert service.config["batch_reuse_probe_request_timeout_seconds"] == 2
     assert service.config["batch_reuse_probe_allow_python_fallback"] is False
+    assert service.config["auto_submit_appeal_on_failure"] is True
 
+
+def test_mark_registration_outcome_submits_appeal_for_failed_luckmail_registration(monkeypatch, caplog):
+    user = FakeUser()
+    service = build_service(monkeypatch, user)
+    appeal_calls = []
+
+    def fake_submit(config, payload, timeout_seconds=15):
+        appeal_calls.append({
+            "payload": dict(payload),
+            "timeout_seconds": timeout_seconds,
+        })
+        return {"appeal_no": "APL-001", "response": {"code": 0, "data": {"appeal_no": "APL-001"}}}
+
+    monkeypatch.setattr(luckmail_module, "submit_luckmail_appeal", fake_submit)
+
+    with caplog.at_level(logging.INFO, logger=luckmail_module.logger.name):
+        service.mark_registration_outcome(
+            email="failed@example.com",
+            success=False,
+            reason="创建用户账户失败: user_already_exists",
+            context={"purchase_id": "301", "token": "tok-failed", "source": "new_purchase"},
+        )
+
+    failed = service._index_store["failed"]["failed@example.com"]
+    assert failed["appeal_status"] == "submitted"
+    assert failed["appeal_no"] == "APL-001"
+    assert failed["appeal_reason"] == "no_receive"
+    assert failed["appeal_description"] == "等待超过 5 分钟，未收到任何验证码邮件，订单已超时失效"
+    assert "邮箱大概率已被 OpenAI 使用" in failed["failure_hint"]
+    assert appeal_calls == [
+        {
+            "payload": {
+                "appeal_type": 2,
+                "reason": "no_receive",
+                "description": "等待超过 5 分钟，未收到任何验证码邮件，订单已超时失效",
+                "purchase_id": 301,
+            },
+            "timeout_seconds": 15,
+        }
+    ]
+    assert any(
+        "probable_cause=邮箱大概率已被 OpenAI 使用" in record.message and "appeal_reason=no_receive" in record.message
+        for record in caplog.records
+    )
+
+
+def test_mark_registration_outcome_skips_appeal_when_disabled(monkeypatch):
+    user = FakeUser()
+    service = build_service(monkeypatch, user, config={"auto_submit_appeal_on_failure": False})
+    called = {"value": False}
+
+    def fake_submit(config, payload, timeout_seconds=15):
+        called["value"] = True
+        return {"appeal_no": "APL-002", "response": {"code": 0}}
+
+    monkeypatch.setattr(luckmail_module, "submit_luckmail_appeal", fake_submit)
+
+    service.mark_registration_outcome(
+        email="disabled@example.com",
+        success=False,
+        reason="创建用户账户失败: user_already_exists",
+        context={"purchase_id": "302", "token": "tok-disabled", "source": "new_purchase"},
+    )
+
+    failed = service._index_store["failed"]["disabled@example.com"]
+    assert "appeal_status" not in failed
+    assert called["value"] is False
+
+
+def test_mark_registration_outcome_skips_appeal_for_cancelled_task(monkeypatch):
+    user = FakeUser()
+    service = build_service(monkeypatch, user)
+    called = {"value": False}
+
+    def fake_submit(config, payload, timeout_seconds=15):
+        called["value"] = True
+        return {"appeal_no": "APL-003", "response": {"code": 0}}
+
+    monkeypatch.setattr(luckmail_module, "submit_luckmail_appeal", fake_submit)
+
+    service.mark_registration_outcome(
+        email="cancelled@example.com",
+        success=False,
+        reason="任务已取消",
+        context={"purchase_id": "303", "token": "tok-cancelled", "source": "new_purchase"},
+    )
+
+    failed = service._index_store["failed"]["cancelled@example.com"]
+    assert "appeal_status" not in failed
+    assert called["value"] is False
+
+
+
+def test_build_appeal_payload_uses_unified_no_receive_reason_and_batch_description(monkeypatch):
+    user = FakeUser()
+    service = build_service(monkeypatch, user)
+
+    already_used_payload = service._build_appeal_payload(
+        "该邮箱已存在 OpenAI",
+        {"purchase_id": "304"},
+    )
+    wrong_code_payload = service._build_appeal_payload(
+        "验证码校验失败",
+        {"purchase_id": "305"},
+    )
+
+    assert already_used_payload["reason"] == "no_receive"
+    assert wrong_code_payload["reason"] == "no_receive"
+    assert already_used_payload["description"] == "等待超过 5 分钟，未收到任何验证码邮件，订单已超时失效"
+    assert wrong_code_payload["description"] == "等待超过 5 分钟，未收到任何验证码邮件，订单已超时失效"
 
 def test_create_email_skips_reused_purchase_that_fails_alive(monkeypatch):
     user = FakeUser()

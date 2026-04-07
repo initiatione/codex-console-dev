@@ -2,6 +2,8 @@
 
 ## v1.1.3
 
+- 调整 LuckMail 注册失败自动申诉与终端提示：`src/services/luckmail_appeal.py` 现统一按 `reason=no_receive` 和“等待超过 5 分钟，未收到任何验证码邮件，订单已超时失效”提交申诉，与根目录 `luckmail_batch_appeal.py` 保持一致；同时 `src/services/luckmail_mail.py` 会在终端日志中明确打印本次失败的大概率原因，并说明已按“未收到验证码”发起自动申诉。
+
 - 澄清 LuckMail 复用邮箱预扫描的诊断日志：当没有命中可复用已购邮箱候选时，日志现明确说明“仅跳过复用阶段探活并转入新购；新购后仍会继续执行邮箱可用性检查”，避免把该提示误解为新购链路不再做可用性检测。
 
 - 修正根目录 `luckmail_batch_appeal.py` 的申诉原因代码：根据 LuckMail 官方 `llms.txt` 文档，申诉 `reason` 的有效值已切换为 `email_unavailable / no_receive / wrong_code / already_used / other`；脚本默认值现从无效的 `no_code` 改为 `no_receive`，对应“无法收件 / 收不到验证码”场景。
@@ -94,3 +96,4 @@
 - 修复 LuckMail 连续无库存时的失控空转：仅在 `src/services/luckmail_mail.py` 内新增“无库存熔断”逻辑，按批次统计短时间内连续 `code=2003/无库存` 返回；达到阈值后当前任务立即失败，并发出进程退出请求，阻止后续 LuckMail 任务继续空转。默认阈值为 5 次、窗口 60 秒、退出延迟 0.5 秒；同时补充 LuckMail 定向测试覆盖“触发熔断”和“成功后重置计数”两条路径。
 
 - 调整 LuckMail 无库存熔断策略：达到阈值后不再直接终止进程，而是仅停止当前批次任务并取消未启动子任务；同时为批量状态接口增加日志增量回补，前端会在批量 WebSocket 建立时主动补抓 `[邮箱预热]` 等批次级日志，避免并行模式下预检查信息在终端缺失。
+
