@@ -574,7 +574,7 @@ def test_pick_reusable_purchase_inbox_logs_when_no_candidates(monkeypatch, caplo
 
     assert result is None
     assert any(
-        "未找到可复用已购邮箱候选" in record.message
+        "跳过复用阶段探活并直接尝试新购；新购后仍会继续执行邮箱可用性检查" in record.message
         for record in caplog.records
     )
     alive_calls = [call for call in user.calls if call[0] == "check_token_alive"]
@@ -868,3 +868,4 @@ def test_success_resets_no_stock_breaker(monkeypatch):
         service.create_email({"batch_id": "batch-reset"})
 
     assert stop_requests == []
+

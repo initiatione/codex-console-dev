@@ -1704,7 +1704,7 @@ class LuckMailService(BaseEmailService):
         if not candidates:
             if log_when_empty:
                 logger.info(
-                    "LuckMail 未找到可复用已购邮箱候选，跳过邮箱可用性检查并直接尝试新购: "
+                    "LuckMail 未找到可复用已购邮箱候选，跳过复用阶段探活并直接尝试新购；新购后仍会继续执行邮箱可用性检查: "
                     f"project_code={project_code}, email_type={email_type}, domain={preferred_domain or '-'}"
                 )
             return []
@@ -2387,3 +2387,4 @@ class LuckMailService(BaseEmailService):
             "cached_orders": len(self._orders_by_no),
             "status": self.status.value,
         }
+

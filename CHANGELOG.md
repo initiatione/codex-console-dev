@@ -2,6 +2,8 @@
 
 ## v1.1.3
 
+- 澄清 LuckMail 复用邮箱预扫描的诊断日志：当没有命中可复用已购邮箱候选时，日志现明确说明“仅跳过复用阶段探活并转入新购；新购后仍会继续执行邮箱可用性检查”，避免把该提示误解为新购链路不再做可用性检测。
+
 - 修正根目录 `luckmail_batch_appeal.py` 的申诉原因代码：根据 LuckMail 官方 `llms.txt` 文档，申诉 `reason` 的有效值已切换为 `email_unavailable / no_receive / wrong_code / already_used / other`；脚本默认值现从无效的 `no_code` 改为 `no_receive`，对应“无法收件 / 收不到验证码”场景。
 
 - 调整根目录 `luckmail_batch_appeal.py` 的默认申诉参数：批量申诉现默认使用 `reason=no_receive`，详细说明改为“等待超过 5 分钟，未收到任何验证码邮件，订单已超时失效”，与 LuckMail 文档中的“未收到验证码”场景保持一致，避免无效的申诉原因类型。
