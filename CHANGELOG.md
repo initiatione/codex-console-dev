@@ -2,6 +2,14 @@
 
 ## v1.1.3
 
+- 修正根目录 `luckmail_batch_appeal.py` 的申诉原因代码：根据 LuckMail 官方 `llms.txt` 文档，申诉 `reason` 的有效值已切换为 `email_unavailable / no_receive / wrong_code / already_used / other`；脚本默认值现从无效的 `no_code` 改为 `no_receive`，对应“无法收件 / 收不到验证码”场景。
+
+- 调整根目录 `luckmail_batch_appeal.py` 的默认申诉参数：批量申诉现默认使用 `reason=no_receive`，详细说明改为“等待超过 5 分钟，未收到任何验证码邮件，订单已超时失效”，与 LuckMail 文档中的“未收到验证码”场景保持一致，避免无效的申诉原因类型。
+
+- 调整根目录 `luckmail_batch_appeal.py` 的数据库加载方式：脚本现会优先读取 `--database-url`，否则自动加载根目录 `.env` 中的 `APP_DATABASE_URL / DATABASE_URL`，避免在未手工导出环境变量时误连默认 SQLite 而查不到 LuckMail 服务。
+
+- 新增根目录脚本 `luckmail_batch_appeal.py`：可直接读取数据库中所有启用的 LuckMail 服务，遍历已购且启用的邮箱，对“邮件列表为空”的邮箱按 `appeal_type=2` 批量提交申诉；并支持 `--dry-run`、按服务筛选、重试空邮箱检查和结果导出。
+
 - 调整 LuckMail 预扫描探活的超时处理：`timeout / network / TLS / connection reset` 等抖动类失败不再直接记入失败邮箱索引；批量预扫描会先走一轮快探活，若仍未准备够共享池，再仅对“暂时失败”的候选发起一轮更宽松的二次探活，降低瞬时链路抖动导致的误杀。
 
 - 优化 LuckMail 批量预扫描体验：复用邮箱的 alive 探活现支持受控并发，新增 `batch_reuse_probe_workers` / `batch_reuse_probe_limit` / `batch_reuse_probe_request_timeout_seconds` 三个配置项；同时为预扫描补充终端动态进度条渲染，并修复并发探活下失败/已注册索引写入的线程安全问题，减少大批量启动前长时间卡在单线程预热的情况。
