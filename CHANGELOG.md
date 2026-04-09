@@ -2,6 +2,8 @@
 
 ## v1.1.3
 
+- 修复 LuckMail Rust CLI 在当前代理切换后仍可能误走旧环境代理的问题：`src/services/luckmail_rust_cli.py` 现会把任务级 `proxy_url` 显式写入子进程代理环境，避免父进程残留的 `HTTP_PROXY/HTTPS_PROXY` 继续污染 Rust backend；同时将 `src/services/luckmail_mail.py` 的批量复用预扫描默认值简化为 `request_timeout=4s`，并删除 `token_alive` 专用的 Python fallback 开关，统一收口为 Rust 失败后直接回退 Python backend，减少 `check_token_alive` 因短超时被批量误判成 Rust backend 失效的情况，并补充对应回归测试。
+
 - 调整 LuckMail 注册失败自动申诉与终端提示：`src/services/luckmail_appeal.py` 现统一按 `reason=no_receive` 和“等待超过 5 分钟，未收到任何验证码邮件，订单已超时失效”提交申诉，与根目录 `luckmail_batch_appeal.py` 保持一致；同时 `src/services/luckmail_mail.py` 会在终端日志中明确打印本次失败的大概率原因，并说明已按“未收到验证码”发起自动申诉。
 
 - 澄清 LuckMail 复用邮箱预扫描的诊断日志：当没有命中可复用已购邮箱候选时，日志现明确说明“仅跳过复用阶段探活并转入新购；新购后仍会继续执行邮箱可用性检查”，避免把该提示误解为新购链路不再做可用性检测。

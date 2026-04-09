@@ -174,8 +174,7 @@ class LuckMailService(BaseEmailService):
             "reuse_purchase_candidate_limit": 3,
             "batch_reuse_probe_workers": 8,
             "batch_reuse_probe_limit": 24,
-            "batch_reuse_probe_request_timeout_seconds": 2,
-            "batch_reuse_probe_allow_python_fallback": False,
+            "batch_reuse_probe_request_timeout_seconds": 4,
             # 已购邮箱在真正投入流程前先做 token alive 检查，避免复用失活邮箱。
             "ensure_purchase_ready": True,
             "token_alive_timeout": 20,
@@ -210,6 +209,7 @@ class LuckMailService(BaseEmailService):
         self.config["preferred_domain"] = str(self.config.get("preferred_domain") or "").strip().lstrip("@")
         self.config["sdk_preference"] = str(self.config.get("sdk_preference") or "auto").strip().lower()
         self.config["rust_cli_path"] = str(self.config.get("rust_cli_path") or "").strip().strip('"')
+        self.config["proxy_url"] = str(self.config.get("proxy_url") or "").strip()
         if self.config["sdk_preference"] not in {"auto", "rust", "python"}:
             self.config["sdk_preference"] = "auto"
         self.config["inbox_mode"] = self._normalize_inbox_mode(self.config.get("inbox_mode"))
@@ -220,12 +220,8 @@ class LuckMailService(BaseEmailService):
         self.config["batch_reuse_probe_workers"] = max(int(self.config.get("batch_reuse_probe_workers") or 8), 1)
         self.config["batch_reuse_probe_limit"] = max(int(self.config.get("batch_reuse_probe_limit") or 24), 1)
         self.config["batch_reuse_probe_request_timeout_seconds"] = max(
-            int(self.config.get("batch_reuse_probe_request_timeout_seconds") or 2),
+            int(self.config.get("batch_reuse_probe_request_timeout_seconds") or 4),
             1,
-        )
-        self.config["batch_reuse_probe_allow_python_fallback"] = _coerce_bool(
-            self.config.get("batch_reuse_probe_allow_python_fallback", False),
-            False,
         )
         self.config["ensure_purchase_ready"] = _coerce_bool(self.config.get("ensure_purchase_ready", True), True)
         self.config["token_alive_timeout"] = max(int(self.config.get("token_alive_timeout") or 20), 1)
@@ -278,6 +274,7 @@ class LuckMailService(BaseEmailService):
                 base_url=self.config["base_url"],
                 api_key=self.config["api_key"],
                 timeout_seconds=int(self.config.get("timeout") or 30),
+                proxy_url=self.config["proxy_url"],
             )
 
         self.client = None
@@ -548,14 +545,13 @@ class LuckMailService(BaseEmailService):
         self,
         token: str,
         request_timeout_seconds: Optional[int] = None,
-        allow_python_fallback: bool = True,
     ):
         rust_call = None
         if self._rust_backend is not None:
             rust_call = lambda: self._rust_backend.check_token_alive(token, timeout_seconds=request_timeout_seconds)
         python_alive_method = getattr(getattr(self.client, "user", None), "check_token_alive", None)
         python_call = None
-        if callable(python_alive_method) and (allow_python_fallback or self._rust_backend is None or self.config.get("sdk_preference") == "python"):
+        if callable(python_alive_method):
             python_call = lambda: python_alive_method(token)
         return self._call_preferred_backend("check_token_alive", rust_call=rust_call, python_call=python_call)
 
@@ -705,7 +701,6 @@ class LuckMailService(BaseEmailService):
         self,
         order_info: Dict[str, Any],
         request_timeout_seconds: Optional[int] = None,
-        allow_python_fallback: bool = True,
     ) -> bool:
         if not bool(self.config.get("ensure_purchase_ready", True)):
             return True
@@ -744,7 +739,6 @@ class LuckMailService(BaseEmailService):
                 result = self._backend_check_token_alive(
                     token,
                     request_timeout_seconds=effective_timeout,
-                    allow_python_fallback=allow_python_fallback,
                 )
                 alive = bool(self._extract_field(result, "alive"))
                 status = str(self._extract_field(result, "status") or "").strip().lower()
@@ -788,7 +782,6 @@ class LuckMailService(BaseEmailService):
         self,
         info: Dict[str, Any],
         request_timeout_seconds: Optional[int] = None,
-        allow_python_fallback: bool = False,
     ) -> Tuple[str, Optional[Dict[str, Any]]]:
         email = self._normalize_email(info.get("email"))
         if not email:
@@ -801,7 +794,6 @@ class LuckMailService(BaseEmailService):
             if self._ensure_purchase_inbox_ready(
                 info,
                 request_timeout_seconds=request_timeout_seconds,
-                allow_python_fallback=allow_python_fallback,
             ):
                 return "ready", info
         except Exception as exc:
@@ -1547,10 +1539,9 @@ class LuckMailService(BaseEmailService):
             ),
         )
         request_timeout_seconds = max(
-            int(self.config.get("batch_reuse_probe_request_timeout_seconds") or 2),
+            int(self.config.get("batch_reuse_probe_request_timeout_seconds") or 4),
             1,
         )
-        allow_python_fallback = bool(self.config.get("batch_reuse_probe_allow_python_fallback", False))
         selected_items = probe_items[:probe_limit]
         if not selected_items:
             return []
@@ -1559,7 +1550,6 @@ class LuckMailService(BaseEmailService):
         logger.info(
             "LuckMail 批量预扫描启用并发探活: "
             f"workers={worker_count}, probe_limit={probe_limit}, request_timeout={request_timeout_seconds}s, "
-            f"allow_python_fallback={allow_python_fallback}, "
             f"desired={desired_count}, candidates={len(probe_items)}"
         )
 
@@ -1591,7 +1581,6 @@ class LuckMailService(BaseEmailService):
                     self._probe_reusable_purchase_candidate,
                     dict(info),
                     request_timeout_seconds,
-                    allow_python_fallback,
                 ): index
                 for index, info in selected_items
             }
@@ -1758,10 +1747,9 @@ class LuckMailService(BaseEmailService):
         )
         total_units = probe_limit
         request_timeout_seconds = max(
-            int(self.config.get("batch_reuse_probe_request_timeout_seconds") or 2),
+            int(self.config.get("batch_reuse_probe_request_timeout_seconds") or 4),
             1,
         )
-        allow_python_fallback = bool(self.config.get("batch_reuse_probe_allow_python_fallback", False))
         prepared: List[Dict[str, Any]] = []
         failed_count = 0
         skipped_count = 0
@@ -1785,7 +1773,6 @@ class LuckMailService(BaseEmailService):
             status, ready_info = self._probe_reusable_purchase_candidate(
                 info,
                 request_timeout_seconds=request_timeout_seconds,
-                allow_python_fallback=allow_python_fallback,
             )
             if status == "ready" and ready_info:
                 prepared.append(ready_info)
@@ -1812,7 +1799,7 @@ class LuckMailService(BaseEmailService):
         if remaining_needed > 0 and transient_items:
             retry_timeout = max(
                 int(self.config.get("token_alive_request_timeout") or 4),
-                max(int(self.config.get("batch_reuse_probe_request_timeout_seconds") or 2), 1) * 3,
+                max(int(self.config.get("batch_reuse_probe_request_timeout_seconds") or 4), 1) * 3,
             )
             retry_limit = min(len(transient_items), max(remaining_needed * 2, remaining_needed))
             total_units += retry_limit
@@ -1826,7 +1813,6 @@ class LuckMailService(BaseEmailService):
                 status, ready_info = self._probe_reusable_purchase_candidate(
                     retry_info,
                     request_timeout_seconds=retry_timeout,
-                    allow_python_fallback=True,
                 )
                 if status == "ready" and ready_info:
                     prepared.append(ready_info)

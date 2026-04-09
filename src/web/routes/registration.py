@@ -1390,8 +1390,7 @@ def _prepare_luckmail_batch_reuse_pool_sync(
         "scan_page_size": int(config.get("purchase_scan_page_size") or 100),
         "probe_workers": int(config.get("batch_reuse_probe_workers") or 8),
         "probe_limit": int(config.get("batch_reuse_probe_limit") or 24),
-        "probe_request_timeout_seconds": int(config.get("batch_reuse_probe_request_timeout_seconds") or 2),
-        "probe_python_fallback": bool(config.get("batch_reuse_probe_allow_python_fallback", False)),
+        "probe_request_timeout_seconds": int(config.get("batch_reuse_probe_request_timeout_seconds") or 4),
     }
 
 
@@ -1433,8 +1432,7 @@ async def _prepare_luckmail_batch_reuse_pool(
         f"service={result.get('service_name') or 'luckmail'}, prepared={result.get('prepared_count', 0)}/{result.get('requested_count', 0)}, "
         f"scan_pages={result.get('scan_pages', 0)}, page_size={result.get('scan_page_size', 0)}, "
         f"probe_workers={result.get('probe_workers', 0)}, probe_limit={result.get('probe_limit', 0)}, "
-        f"probe_timeout={result.get('probe_request_timeout_seconds', 0)}s, "
-        f"probe_python_fallback={str(bool(result.get('probe_python_fallback', False))).lower()}"
+        f"probe_timeout={result.get('probe_request_timeout_seconds', 0)}s"
     )
     if int(result.get("prepared_count") or 0) <= 0:
         add_batch_log("[邮箱预热] 当前没有可复用邮箱，后续任务将直接尝试新购/建单")

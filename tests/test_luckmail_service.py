@@ -183,8 +183,7 @@ def test_luckmail_defaults_use_wider_purchase_prescan_window(monkeypatch):
     assert service.config["purchase_scan_page_size"] == 100
     assert service.config["batch_reuse_probe_workers"] == 8
     assert service.config["batch_reuse_probe_limit"] == 24
-    assert service.config["batch_reuse_probe_request_timeout_seconds"] == 2
-    assert service.config["batch_reuse_probe_allow_python_fallback"] is False
+    assert service.config["batch_reuse_probe_request_timeout_seconds"] == 4
     assert service.config["auto_submit_appeal_on_failure"] is True
 
 
@@ -500,6 +499,33 @@ def test_resolve_luckmail_rust_cli_path_prefers_installed_binary(monkeypatch, tm
     assert rust_cli_module.resolve_luckmail_rust_cli_path({}) == installed_binary.resolve()
 
 
+def test_rust_cli_backend_uses_configured_proxy_env(monkeypatch, tmp_path):
+    binary_name = "luckmail-cli.exe" if sys.platform.startswith("win") else "luckmail-cli"
+    binary_path = tmp_path / binary_name
+    binary_path.write_text("binary", encoding="utf-8")
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = list(command)
+        captured["env"] = kwargs.get("env") or {}
+        return SimpleNamespace(returncode=0, stdout='{"balance":"8.0000"}', stderr="")
+
+    monkeypatch.setattr(rust_cli_module.subprocess, "run", fake_run)
+    backend = rust_cli_module.LuckMailRustCliBackend(
+        binary_path=binary_path,
+        base_url="https://mails.luckyous.com/",
+        api_key="lm-key",
+        timeout_seconds=8,
+        proxy_url="http://127.0.0.1:6984",
+    )
+
+    assert backend.get_balance() == {"balance": "8.0000"}
+    assert captured["command"][0] == str(binary_path.resolve())
+    assert captured["env"]["HTTP_PROXY"] == "http://127.0.0.1:6984"
+    assert captured["env"]["HTTPS_PROXY"] == "http://127.0.0.1:6984"
+    assert captured["env"]["http_proxy"] == "http://127.0.0.1:6984"
+    assert captured["env"]["https_proxy"] == "http://127.0.0.1:6984"
+
 
 def test_check_health_prefers_rust_cli_backend_when_available(monkeypatch):
     user = FakeUser()
@@ -591,8 +617,9 @@ def test_backend_check_token_alive_passes_request_timeout_to_rust_cli(monkeypatc
     assert user.calls == []
 
 
-def test_backend_check_token_alive_can_skip_python_fallback(monkeypatch):
+def test_backend_check_token_alive_falls_back_to_python_when_rust_fails(monkeypatch):
     user = FakeUser()
+    user.alive_results["tok-fast"] = {"alive": True, "status": "ok", "mail_count": 1}
 
     def fake_check_token_alive(self, token, timeout_seconds=None):
         raise rust_cli_module.LuckMailRustCliError("rust timeout")
@@ -605,14 +632,10 @@ def test_backend_check_token_alive_can_skip_python_fallback(monkeypatch):
         rust_cli_path="d:/codex-console-test/fake-luckmail-cli.exe",
     )
 
-    with pytest.raises(rust_cli_module.LuckMailRustCliError, match="rust timeout"):
-        service._backend_check_token_alive(
-            "tok-fast",
-            request_timeout_seconds=2,
-            allow_python_fallback=False,
-        )
+    result = service._backend_check_token_alive("tok-fast", request_timeout_seconds=2)
 
-    assert user.calls == []
+    assert result["alive"] is True
+    assert user.calls == [("check_token_alive", "tok-fast")]
 
 
 def test_pick_reusable_purchase_inbox_limits_alive_candidates(monkeypatch):
@@ -748,7 +771,7 @@ def test_prepare_batch_reusable_inboxes_probes_candidates_concurrently(monkeypat
     }
     lock = threading.Lock()
 
-    def fake_ready(order_info, request_timeout_seconds=None, allow_python_fallback=True):
+    def fake_ready(order_info, request_timeout_seconds=None):
         with lock:
             state["active"] += 1
             state["max_active"] = max(state["max_active"], state["active"])
@@ -796,8 +819,8 @@ def test_prepare_batch_reusable_inboxes_retries_transient_candidates_without_bla
 
     calls = []
 
-    def fake_ready(order_info, request_timeout_seconds=None, allow_python_fallback=True):
-        calls.append((request_timeout_seconds, allow_python_fallback))
+    def fake_ready(order_info, request_timeout_seconds=None):
+        calls.append(request_timeout_seconds)
         if len(calls) == 1:
             order_info["_alive_failure_kind"] = "transient"
             order_info["_alive_failure_detail"] = "timeout"
@@ -810,7 +833,7 @@ def test_prepare_batch_reusable_inboxes_retries_transient_candidates_without_bla
     prepared_count = service.prepare_batch_reusable_inboxes("batch-transient", 1)
 
     assert prepared_count == 1
-    assert calls == [(2, False), (6, True)]
+    assert calls == [2, 6]
     assert service._index_store["failed"] == {}
 
 

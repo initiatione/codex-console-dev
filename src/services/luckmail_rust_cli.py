@@ -1,6 +1,7 @@
 """LuckMail Rust CLI backend helpers."""
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -70,11 +71,19 @@ def resolve_luckmail_rust_cli_path(config: Optional[Dict[str, Any]] = None) -> O
 class LuckMailRustCliBackend:
     """Thin subprocess wrapper around the local Rust CLI adapter."""
 
-    def __init__(self, binary_path: Path, base_url: str, api_key: str, timeout_seconds: int = 30):
+    def __init__(
+        self,
+        binary_path: Path,
+        base_url: str,
+        api_key: str,
+        timeout_seconds: int = 30,
+        proxy_url: Optional[str] = None,
+    ):
         self.binary_path = str(Path(binary_path).resolve())
         self.base_url = str(base_url or "").strip().rstrip("/")
         self.api_key = str(api_key or "").strip()
         self.timeout_seconds = max(int(timeout_seconds or 30), 1)
+        self.proxy_url = str(proxy_url or "").strip()
 
     def _base_command(self, timeout_seconds: Optional[int] = None) -> List[str]:
         effective_timeout = max(int(timeout_seconds or self.timeout_seconds), 1)
@@ -86,12 +95,20 @@ class LuckMailRustCliBackend:
 
     def _run_json(self, *args: str, timeout_seconds: Optional[int] = None) -> Any:
         command = self._base_command(timeout_seconds=timeout_seconds) + [str(arg) for arg in args if arg is not None]
+        env = None
+        if self.proxy_url:
+            env = os.environ.copy()
+            env["HTTP_PROXY"] = self.proxy_url
+            env["HTTPS_PROXY"] = self.proxy_url
+            env["http_proxy"] = self.proxy_url
+            env["https_proxy"] = self.proxy_url
         completed = subprocess.run(
             command,
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
+            env=env,
             timeout=max(int(timeout_seconds or self.timeout_seconds), 1) + 5,
             check=False,
         )

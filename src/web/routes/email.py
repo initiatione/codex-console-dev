@@ -152,7 +152,6 @@ def normalize_email_service_config(service_type: str, config: Optional[Dict[str,
 
         for key in (
             "reuse_existing_purchases",
-            "batch_reuse_probe_allow_python_fallback",
             "ensure_purchase_ready",
             "fallback_to_order_on_no_stock",
             "token_mail_fallback",
@@ -459,8 +458,7 @@ async def get_service_types():
                     {"name": "purchase_scan_page_size", "label": "预扫描每页数量", "required": False, "default": 100, "type": "number"},
                     {"name": "batch_reuse_probe_workers", "label": "预扫描探活并发数", "required": False, "default": 8, "type": "number"},
                     {"name": "batch_reuse_probe_limit", "label": "预扫描探活候选上限", "required": False, "default": 24, "type": "number"},
-                    {"name": "batch_reuse_probe_request_timeout_seconds", "label": "预扫描单次探活超时(秒)", "required": False, "default": 2, "type": "number"},
-                    {"name": "batch_reuse_probe_allow_python_fallback", "label": "预扫描失败时回退 Python", "required": False, "default": False, "placeholder": "true / false"},
+                    {"name": "batch_reuse_probe_request_timeout_seconds", "label": "预扫描单次探活超时(秒)", "required": False, "default": 4, "type": "number"},
                     {"name": "ensure_purchase_ready", "label": "先做邮箱可用性检查", "required": False, "default": True, "placeholder": "true / false"},
                     {"name": "reuse_purchase_candidate_limit", "label": "复用探测候选上限", "required": False, "default": 3, "type": "number"},
                     {"name": "token_alive_timeout", "label": "探活超时(秒)", "required": False, "default": 20, "type": "number"},
